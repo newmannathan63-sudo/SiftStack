@@ -256,7 +256,7 @@ async def _set_kendo_datepicker(page: Page, name: str, value_mdy: str) -> bool:
     if not await el.count():
         logger.warning("DuvalClerk: datepicker input[name='%s'] not found", name)
         return False
-    await el.triple_click()
+    await el.click(click_count=3)
     await el.fill(value_mdy)
     await el.press("Tab")   # triggers Kendo blur/change validation
     logger.debug("Set datepicker %s = %s", name, value_mdy)
@@ -276,7 +276,7 @@ async def _set_kendo_combobox(page: Page, input_name: str, value: str) -> bool:
         logger.warning("DuvalClerk: combobox input[name='%s'] not found", input_name)
         return False
 
-    await el.triple_click()
+    await el.click(click_count=3)
     await el.fill("")
     await el.type(value, delay=50)
 
