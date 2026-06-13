@@ -16,7 +16,6 @@ from pathlib import Path
 import config
 from config import (
     LOG_DIR,
-    NOTICE_TYPES,
     OUTPUT_DIR,
     SAVED_SEARCHES,
     SavedSearch,
@@ -51,8 +50,13 @@ def _filter_searches(
 # ── Preflight health checks ─────────────────────────────────────────
 
 
-def _preflight_check(mode: str) -> list[str]:
+def _preflight_check(mode: str, searches=None) -> list[str]:
     """Verify required API keys and service connectivity before running.
+
+    Args:
+        mode:    CLI mode string ("daily", "historical", etc.)
+        searches: Filtered SavedSearch list for this run; used to skip TNPN
+                  credential/CAPTCHA checks when all searches are JDR-sourced.
 
     Returns a list of failure descriptions. Empty list = all checks passed.
     """
@@ -63,7 +67,11 @@ def _preflight_check(mode: str) -> list[str]:
     enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
-    if mode in scrape_modes:
+    # Skip TNPN-specific checks when no search in this run needs TNPN
+    # (JDR and Duval Clerk are both public portals — no login or CAPTCHA required).
+    has_tnpn = bool(searches and any(getattr(s, "source", "tnpn") == "tnpn" for s in searches))
+
+    if mode in scrape_modes and has_tnpn:
         if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
             failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
         if not config.CAPTCHA_API_KEY:
@@ -90,8 +98,8 @@ def _preflight_check(mode: str) -> list[str]:
         if not config.TRESTLE_API_KEY:
             failures.append("TRESTLE_API_KEY not set (required for phone validation)")
 
-    # ── Connectivity checks (only for scrape modes) ─────────────────
-    if mode in scrape_modes:
+    # ── Connectivity checks (only for TNPN scrape modes) ────────────
+    if mode in scrape_modes and has_tnpn:
         import requests as _requests
         try:
             resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
@@ -100,8 +108,8 @@ def _preflight_check(mode: str) -> list[str]:
         except Exception as e:
             failures.append(f"Cannot reach tnpublicnotice.com: {e}")
 
-    # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
+    # ── 2Captcha balance check (TNPN only) ──────────────────────────
+    if mode in scrape_modes and has_tnpn and config.CAPTCHA_API_KEY:
         import requests as _requests
         try:
             resp = _requests.get(
@@ -186,25 +194,26 @@ async def actor_main() -> None:
         include_commercial = actor_input.get("include_commercial", False)
         include_entities = actor_input.get("include_entities", False)
 
-        # Validate
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            Actor.log.error("tn_username and tn_password are required")
-            try:
-                from slack_notifier import notify_preflight_failure
-                notify_preflight_failure(["TNPN credentials missing"])
-            except Exception:
-                pass
-            await Actor.fail(status_message="Missing SiftStack credentials")
-            return
-        if not config.CAPTCHA_API_KEY:
-            Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail")
-
         # Filter searches
         searches = _filter_searches(counties, types)
         if not searches:
             Actor.log.error("No saved searches match the given counties/types filters")
             await Actor.fail(status_message="No matching saved searches")
             return
+
+        # Validate credentials — only require TNPN creds if any search needs them
+        has_tnpn = bool(searches and any(getattr(s, "source", "tnpn") == "tnpn" for s in searches))
+        if has_tnpn and (not config.TNPN_EMAIL or not config.TNPN_PASSWORD):
+            Actor.log.error("tn_username and tn_password are required for TN searches")
+            try:
+                from slack_notifier import notify_preflight_failure
+                notify_preflight_failure(["TNPN credentials missing"])
+            except Exception:
+                pass
+            await Actor.fail(status_message="Missing TNPN credentials")
+            return
+        if has_tnpn and not config.CAPTCHA_API_KEY:
+            Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail for TN searches")
 
         Actor.log.info(
             "Running %d saved searches: %s",
@@ -296,7 +305,7 @@ async def actor_main() -> None:
             Actor.log.info("Starting from page %d (skipping earlier pages)", start_page)
 
         try:
-            kvs = await Actor.open_key_value_store()
+            kvs = await Actor.open_key_value_store(name="siftstack-state")
 
             # ── Load last_run_date from Apify KVS (persists between runs) ──
             if mode == "daily" and not since_date_override:
@@ -323,14 +332,46 @@ async def actor_main() -> None:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
             # ── Scrape ────────────────────────────────────────────────
-            notices = await scrape_all(
-                mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
-                since_date_override=since_date_override or None,
-                llm_api_key=config.ANTHROPIC_API_KEY or None,
-                start_page=start_page,
-                seen_ids=seen_ids,
-                on_search_complete=persist_seen_ids,
-            )
+            tnpn_searches_actor        = [s for s in searches if getattr(s, "source", "tnpn") == "tnpn"]
+            jdr_searches_actor         = [s for s in searches if getattr(s, "source", "tnpn") == "jdr"]
+            duval_clerk_searches_actor = [s for s in searches if getattr(s, "source", "tnpn") == "duval_clerk"]
+
+            notices = []
+
+            if tnpn_searches_actor:
+                tnpn_notices = await scrape_all(
+                    mode=mode, searches=tnpn_searches_actor, proxy_url=proxy_url, on_batch=push_batch,
+                    since_date_override=since_date_override or None,
+                    llm_api_key=config.ANTHROPIC_API_KEY or None,
+                    start_page=start_page,
+                    seen_ids=seen_ids,
+                    on_search_complete=persist_seen_ids,
+                )
+                notices.extend(tnpn_notices)
+
+            if jdr_searches_actor:
+                from jdr_scraper import scrape_jdr_all
+                jdr_notices = await scrape_jdr_all(
+                    searches=jdr_searches_actor,
+                    since_date=since_date_override or None,
+                    seen_ids=seen_ids,
+                    llm_api_key=config.ANTHROPIC_API_KEY or None,
+                )
+                await persist_seen_ids(seen_ids)
+                notices.extend(jdr_notices)
+
+            if duval_clerk_searches_actor:
+                from duval_clerk_scraper import scrape_duval_clerk_all
+                dc_notices = await scrape_duval_clerk_all(
+                    searches=duval_clerk_searches_actor,
+                    since_date=since_date_override or None,
+                    seen_ids=seen_ids,
+                    llm_api_key=config.ANTHROPIC_API_KEY or None,
+                    proxy_url=proxy_url,
+                )
+                await persist_seen_ids(seen_ids)
+                notices.extend(dc_notices)
+
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
             if probate_notices:
@@ -415,7 +456,7 @@ async def actor_main() -> None:
             if dp_candidates:
                 try:
                     from report_generator import generate_record_pdf
-                    kvs = await Actor.open_key_value_store()
+                    kvs = await Actor.open_key_value_store(name="siftstack-state")
                     kvs_id = kvs._id if hasattr(kvs, '_id') else ''
                     report_dir = Path("output/reports")
 
@@ -439,7 +480,7 @@ async def actor_main() -> None:
             # ── Write CSV ─────────────────────────────────────────────
             csv_path = write_csv(notices)
             if not kvs:
-                kvs = await Actor.open_key_value_store()
+                kvs = await Actor.open_key_value_store(name="siftstack-state")
             with open(csv_path, "rb") as f:
                 await kvs.set_value("output.csv", f.read(), content_type="text/csv")
             Actor.log.info("CSV saved to key-value store as 'output.csv'")
@@ -474,7 +515,7 @@ async def actor_main() -> None:
                 from datasift_formatter import write_datasift_split_csvs
 
                 csv_infos = write_datasift_split_csvs(notices)
-                kvs = await Actor.open_key_value_store()
+                kvs = await Actor.open_key_value_store(name="siftstack-state")
                 for info in csv_infos:
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
                     with open(info["path"], "rb") as f:
@@ -1454,8 +1495,16 @@ def cli_main() -> None:
 
     setup_logging(args.verbose)
 
+    # ── Pre-compute searches for source-aware preflight ──────────────
+    # Done early so _preflight_check can skip TNPN checks for JDR-only runs.
+    _early_searches = None
+    if args.mode in ("daily", "historical"):
+        _ec = [c.strip() for c in args.counties.split(",")] if args.counties and args.counties.lower() != "all" else None
+        _et = [t.strip() for t in args.types.split(",")] if args.types and args.types.lower() != "all" else None
+        _early_searches = _filter_searches(_ec, _et)
+
     # ── Preflight health checks ──────────────────────────────────────
-    preflight_failures = _preflight_check(args.mode)
+    preflight_failures = _preflight_check(args.mode, searches=_early_searches)
     if preflight_failures:
         for f in preflight_failures:
             logging.error("Preflight FAILED: %s", f)
@@ -1717,13 +1766,49 @@ def cli_main() -> None:
 
 def _run_scrape_pipeline(args, searches) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # Scrape
-    notices = asyncio.run(scrape_all(
-        mode=args.mode, searches=searches,
-        llm_api_key=config.ANTHROPIC_API_KEY or None,
-        since_date_override=args.since,
-        max_notices=args.max_notices,
-    ))
+    from config import SEEN_IDS_FILE, load_state, save_state
+
+    tnpn_searches        = [s for s in searches if getattr(s, "source", "tnpn") == "tnpn"]
+    jdr_searches         = [s for s in searches if getattr(s, "source", "tnpn") == "jdr"]
+    duval_clerk_searches = [s for s in searches if getattr(s, "source", "tnpn") == "duval_clerk"]
+
+    notices = []
+
+    # ── TNPN (tnpublicnotice.com) — ASP.NET + CAPTCHA ───────────────
+    if tnpn_searches:
+        tnpn_notices = asyncio.run(scrape_all(
+            mode=args.mode, searches=tnpn_searches,
+            llm_api_key=config.ANTHROPIC_API_KEY or None,
+            since_date_override=args.since,
+            max_notices=args.max_notices,
+        ))
+        notices.extend(tnpn_notices)
+
+    # ── JDR (legals.jaxdailyrecord.com) — public, no CAPTCHA ────────
+    if jdr_searches:
+        from jdr_scraper import scrape_jdr_all
+        seen_ids = load_state(SEEN_IDS_FILE)
+        jdr_notices = asyncio.run(scrape_jdr_all(
+            searches=jdr_searches,
+            since_date=args.since,
+            seen_ids=seen_ids,
+            llm_api_key=config.ANTHROPIC_API_KEY or None,
+        ))
+        save_state(SEEN_IDS_FILE, seen_ids)
+        notices.extend(jdr_notices)
+
+    # ── Duval Clerk (or.duvalclerk.com) — public, no CAPTCHA ─────────
+    if duval_clerk_searches:
+        from duval_clerk_scraper import scrape_duval_clerk_all
+        seen_ids = load_state(SEEN_IDS_FILE)
+        dc_notices = asyncio.run(scrape_duval_clerk_all(
+            searches=duval_clerk_searches,
+            since_date=args.since,
+            seen_ids=seen_ids,
+            llm_api_key=config.ANTHROPIC_API_KEY or None,
+        ))
+        save_state(SEEN_IDS_FILE, seen_ids)
+        notices.extend(dc_notices)
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:
