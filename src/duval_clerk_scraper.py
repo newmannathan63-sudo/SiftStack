@@ -214,7 +214,9 @@ def _parse_lp_row(row_text: str, search: SavedSearch, recorded_date: str, seq: i
             raw_name = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_name
         notice.owner_name = raw_name.title()
 
-    # Property address (may not be present in index — that's OK)
+    # Property address (may not be present in index — that's OK).
+    # OR index rows rarely include street addresses; enrichment fills via
+    # owner name lookup after DataSift upload.
     am = LP_ADDR_RE.search(row_text)
     if am:
         addr = _clean(am.group(1))
@@ -223,6 +225,10 @@ def _parse_lp_row(row_text: str, search: SavedSearch, recorded_date: str, seq: i
             notice.address = addr
             notice.city    = city
             notice.zip     = am.group(3) or ""
+    if not notice.city:
+        # Default to Jacksonville — covers ~95% of Duval County residential.
+        # DataSift enrichment overrides with actual city once address is found.
+        notice.city = "Jacksonville"
 
     # Case number → append to source_url
     cm = LP_CASE_NO_RE.search(row_text)

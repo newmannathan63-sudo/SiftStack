@@ -239,8 +239,15 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
             and not n.address.strip()
             and n.owner_street.strip()
         )
+        # Lis pendens come from the OR index which never includes a property
+        # address — only grantor name + book/page. Skip address validation;
+        # DataSift enrichment fills the address post-upload via owner name lookup.
+        is_lis_pendens_no_addr = (
+            n.notice_type == "lis_pendens"
+            and not n.address.strip()
+        )
 
-        if not is_probate_no_addr:
+        if not is_probate_no_addr and not is_lis_pendens_no_addr:
             # Required fields
             if not n.address.strip():
                 issues.append("missing address")
