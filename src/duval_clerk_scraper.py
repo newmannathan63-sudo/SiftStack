@@ -326,6 +326,34 @@ async def _submit_search_form(
             logger.error("DuvalClerk search page unreachable")
             return False
 
+    # or.duvalclerk.com shows a Disclaimer/ToS page on fresh sessions.
+    # Detect the redirect and click Accept before the Kendo form is accessible.
+    if "disclaimer" in page.url.lower():
+        logger.info("DuvalClerk: disclaimer page detected (%s) — accepting terms", page.url)
+        accepted = False
+        for sel in [
+            "button:has-text('Accept')",
+            "button:has-text('Agree')",
+            "button:has-text('I Agree')",
+            "button:has-text('Continue')",
+            "a:has-text('Accept')",
+            "a:has-text('I Agree')",
+            "input[type='submit']",
+        ]:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                logger.debug("DuvalClerk: clicked disclaimer button '%s'", sel)
+                accepted = True
+                break
+        if not accepted:
+            logger.error("DuvalClerk: disclaimer page found but no Accept button matched — check selectors")
+            return False
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except PwTimeout:
+            pass
+
     # Give Kendo UI extra time to finish JS initialization after networkidle.
     # Government court sites can be slow to bootstrap Kendo widgets.
     await page.wait_for_timeout(4_000)
