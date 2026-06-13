@@ -316,12 +316,12 @@ async def _submit_search_form(
     """
     logger.info("DuvalClerk: loading search page %s", DUVAL_CLERK_SEARCH_URL)
     try:
-        await page.goto(DUVAL_CLERK_SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_load_state("networkidle", timeout=15_000)
+        await page.goto(DUVAL_CLERK_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
+        await page.wait_for_load_state("networkidle", timeout=20_000)
     except PwTimeout:
         logger.warning("DuvalClerk search page load timed out — retrying once")
         try:
-            await page.goto(DUVAL_CLERK_SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(DUVAL_CLERK_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
         except PwTimeout:
             logger.error("DuvalClerk search page unreachable")
             return False
@@ -759,18 +759,16 @@ async def scrape_duval_clerk_all(
                 "--disable-dev-shm-usage",
             ],
         )
-        ctx_kwargs: dict = dict(
+        # No proxy for Duval Clerk — or.duvalclerk.com is a public government
+        # portal that loads fine from datacenter IPs. Routing through the
+        # residential proxy caused domcontentloaded to time out (30s+).
+        context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        if proxy_url:
-            ctx_kwargs["proxy"] = {"server": proxy_url}
-            logger.info("DuvalClerk: using proxy %s", proxy_url[:40] + "..." if len(proxy_url) > 40 else proxy_url)
-
-        context = await browser.new_context(**ctx_kwargs)
         # Remove navigator.webdriver flag so Kendo UI doesn't see a bot
         await context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
