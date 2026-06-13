@@ -251,8 +251,9 @@ async def _set_kendo_datepicker(page: Page, name: str, value_mdy: str) -> bool:
     on blur. We triple-fill and fire change events to force the widget to accept.
     """
     sel = f"input[name='{name}']"
-    el = await page.query_selector(sel)
-    if not el:
+    # Use locator (not query_selector/ElementHandle) — triple_click() is Locator-only
+    el = page.locator(sel).first
+    if not await el.count():
         logger.warning("DuvalClerk: datepicker input[name='%s'] not found", name)
         return False
     await el.triple_click()
@@ -269,8 +270,9 @@ async def _set_kendo_combobox(page: Page, input_name: str, value: str) -> bool:
     type, wait for the listbox to appear, then click the first matching option.
     """
     sel = f"input[name='{input_name}']"
-    el = await page.query_selector(sel)
-    if not el:
+    # Use locator (not query_selector/ElementHandle) — triple_click() is Locator-only
+    el = page.locator(sel).first
+    if not await el.count():
         logger.warning("DuvalClerk: combobox input[name='%s'] not found", input_name)
         return False
 
