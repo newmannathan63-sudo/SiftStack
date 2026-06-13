@@ -110,7 +110,14 @@ def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
         return int(m.group(1)) > 0
 
     before = len(notices)
-    result = [n for n in notices if _has_house_number(n.address)]
+    # Probate and lis_pendens notices have no property address by design —
+    # probate comes from court records, lis_pendens from the OR index (grantor name only).
+    result = [
+        n for n in notices
+        if _has_house_number(n.address)
+        or (n.notice_type == "probate" and n.owner_street.strip())
+        or n.notice_type == "lis_pendens"
+    ]
     removed = before - len(result)
     if removed:
         logger.info("  Removed %d vacant land records (no house number)", removed)
@@ -174,9 +181,20 @@ def _filter_commercial(notices: list[NoticeData]) -> list[NoticeData]:
 
 
 def _compute_mailable(notices: list[NoticeData]) -> None:
-    """Set mailable flag: 'yes' if address + city + zip all present."""
+    """Set mailable flag: 'yes' if address + city + zip all present.
+
+    Probate notices without a property address are mailable if the PR's
+    mailing address (owner_street + owner_city + owner_zip) is populated.
+    """
     for n in notices:
         if n.address.strip() and n.city.strip() and n.zip.strip():
+            n.mailable = "yes"
+        elif (
+            n.notice_type == "probate"
+            and n.owner_street.strip()
+            and n.owner_city.strip()
+            and n.owner_zip.strip()
+        ):
             n.mailable = "yes"
         else:
             n.mailable = ""
@@ -213,17 +231,27 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
     for n in notices:
         issues = []
 
-        # Required fields
-        if not n.address.strip():
-            issues.append("missing address")
-        elif _GARBAGE_RE.match(n.address):
-            issues.append(f"garbage address: {n.address!r}")
+        # Probate notices use owner_street/owner_city/owner_zip for the PR's
+        # mailing address instead of the property address fields — skip property
+        # address validation for them (the PR contact fields are checked instead).
+        is_probate_no_addr = (
+            n.notice_type == "probate"
+            and not n.address.strip()
+            and n.owner_street.strip()
+        )
 
-        if not n.city.strip():
-            issues.append("missing city")
+        if not is_probate_no_addr:
+            # Required fields
+            if not n.address.strip():
+                issues.append("missing address")
+            elif _GARBAGE_RE.match(n.address):
+                issues.append(f"garbage address: {n.address!r}")
 
-        if not n.zip.strip():
-            issues.append("missing zip")
+            if not n.city.strip():
+                issues.append("missing city")
+
+            if not n.zip.strip():
+                issues.append("missing zip")
 
         # Date format validation (only if populated)
         for date_field in ("date_added", "auction_date"):
@@ -353,7 +381,7 @@ def run_enrichment_pipeline(
         if n.notice_type == "probate"
         and not n.address.strip()
         and n.decedent_name.strip()
-        and n.county.lower() == "knox"
+        and n.county.lower() in ("knox", "duval")
     ]
     if probate_no_addr:
         logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
