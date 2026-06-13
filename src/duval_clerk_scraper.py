@@ -283,21 +283,22 @@ async def _set_kendo_combobox(page: Page, input_name: str, value: str) -> bool:
     # Wait for Kendo listbox popup
     try:
         await page.wait_for_selector(
-            "[role='listbox'] [role='option']", timeout=3_000
+            "[role='listbox'] [role='option']", timeout=6_000
         )
         option = await page.query_selector(
             f"[role='listbox'] [role='option']:has-text('{value.split()[0]}')"
         )
         if option:
             await option.click()
-            logger.debug("Kendo combobox %s set to '%s'", input_name, value)
+            logger.info("DuvalClerk: combobox %s set to '%s' via listbox", input_name, value)
             return True
+        logger.warning("DuvalClerk: listbox appeared but no option matched '%s'", value.split()[0])
     except PwTimeout:
-        pass
+        logger.warning("DuvalClerk: listbox did not appear for combobox %s — falling back to typed value", input_name)
 
     # Fallback: value may already be accepted by the input alone
-    logger.debug(
-        "DuvalClerk: no listbox option matched for '%s' — accepting typed value", value
+    logger.info(
+        "DuvalClerk: combobox %s — accepting typed value '%s' without listbox selection", input_name, value
     )
     await el.press("Tab")
     return True
@@ -356,6 +357,19 @@ async def _submit_search_form(
         except PwTimeout:
             pass
 
+        # After disclaimer acceptance the st= param should redirect us to the
+        # search form, but verify and re-navigate if needed.
+        logger.info("DuvalClerk: URL after disclaimer acceptance = %s", page.url)
+        if "disclaimer" in page.url.lower() or "SearchTypeDocType" not in page.url:
+            logger.info("DuvalClerk: re-navigating to search form after disclaimer")
+            try:
+                await page.goto(DUVAL_CLERK_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except PwTimeout:
+                pass
+
+    logger.info("DuvalClerk: on search page: %s", page.url)
+
     # Give Kendo UI extra time to finish JS initialization after networkidle.
     # Government court sites can be slow to bootstrap Kendo widgets.
     await page.wait_for_timeout(4_000)
@@ -390,18 +404,48 @@ async def _submit_search_form(
     await _set_kendo_datepicker(page, "RecordDateTo",   _to_mdy(end_date))
 
     # ── Submit ───────────────────────────────────────────────────────
-    try:
-        await page.click("button:has-text('Search')", timeout=5_000)
-        logger.debug("Form submitted via Search button")
-    except Exception:
-        logger.warning("DuvalClerk: Search button not found — pressing Enter")
-        await page.keyboard.press("Enter")
+    submitted = False
+    for btn_sel in [
+        "button:has-text('Search')",
+        "input[type='submit'][value='Search']",
+        "button[type='submit']",
+        "input[type='submit']",
+    ]:
+        try:
+            await page.click(btn_sel, timeout=3_000)
+            logger.info("DuvalClerk: form submitted via '%s'", btn_sel)
+            submitted = True
+            break
+        except Exception:
+            continue
+
+    if not submitted:
+        # JS fallback: click the first submit-like element in the form
+        clicked = await page.evaluate("""() => {
+            const btn = document.querySelector(
+                'button[type="submit"], input[type="submit"], button:not([type])'
+            );
+            if (btn) { btn.click(); return btn.textContent || btn.value || 'clicked'; }
+            return null;
+        }""")
+        if clicked:
+            logger.info("DuvalClerk: form submitted via JS click ('%s')", str(clicked).strip()[:40])
+        else:
+            logger.warning("DuvalClerk: no submit button found — pressing Enter as last resort")
+            await page.keyboard.press("Enter")
 
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except PwTimeout:
         pass
     await _delay()
+    logger.info("DuvalClerk: URL after search submit = %s", page.url)
+    # Log a snippet of page text to help diagnose results
+    try:
+        snippet = (await page.inner_text("body"))[:400].replace("\n", " ").strip()
+        logger.info("DuvalClerk: page text after search = %s", snippet)
+    except Exception:
+        pass
     return True
 
 
