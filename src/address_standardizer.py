@@ -125,12 +125,14 @@ def standardize_addresses(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            # Safety: reject non-TN results (bad match on out-of-state address)
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            # Safety: reject results for a different state (bad match on wrong-state address)
+            expected_state = notice.state.upper().strip() if notice.state else "TN"
+            if components and components.state_abbreviation and components.state_abbreviation != expected_state:
                 logger.warning(
-                    "Smarty returned %s for '%s' -- keeping original",
+                    "Smarty returned %s for '%s' (expected %s) -- keeping original",
                     components.state_abbreviation,
                     notice.address,
+                    expected_state,
                 )
                 failed += 1
                 continue
@@ -318,7 +320,8 @@ def retry_with_geocoded_city(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            expected_state = notice.state.upper().strip() if notice.state else "TN"
+            if components and components.state_abbreviation and components.state_abbreviation != expected_state:
                 failed += 1
                 continue
 

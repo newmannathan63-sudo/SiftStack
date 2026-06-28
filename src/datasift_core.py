@@ -221,6 +221,12 @@ async def dismiss_popups(page) -> None:
             document.querySelectorAll('[class*="nps-iframe"], [class*="beamer"]').forEach(
                 el => { el.remove(); removed++; }
             );
+            // Remove aside overlay (filter panel backdrop that blocks pointer events)
+            const aside = document.getElementById('asideOverlay');
+            if (aside) { aside.remove(); removed++; }
+            document.querySelectorAll('[class*="AsideOverlay"]').forEach(
+                el => { el.remove(); removed++; }
+            );
             // Look for the notification popup overlay
             const els = document.querySelectorAll(
                 '[class*="notification"], [class*="Notification"], '

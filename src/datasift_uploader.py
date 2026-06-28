@@ -303,9 +303,30 @@ async def upload_csv(
     # Click "Next Step" to proceed to step 2
     await _click_next_step(page, timeout=30000)
 
-    # ── Wizard Step 2: Add tags ──
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
+    # ── Wizard Step 2 (optional): Property Enrichment ──
+    # DataSift added a new "Enrichment" step between Setup and Add Tags.
+    # Detect it and click through — keep Swap Owners OFF.
+    await page.wait_for_timeout(1500)
+    await _dismiss_popups(page)
+    # Use page text search (not locator comma-OR, which doesn't work for text selectors)
+    page_body = await page.inner_text("body") if await page.locator("body").count() > 0 else ""
+    on_enrichment = "Auto-Enrichment" in page_body or "Property Enrichment" in page_body
+    if not on_enrichment:
+        # Also check via locator as fallback
+        on_enrichment = (
+            await page.get_by_text("Auto-Enrichment", exact=True).count() > 0
+            or await page.get_by_text("Property Enrichment", exact=True).count() > 0
+        )
+    if on_enrichment:
+        logger.info("Wizard Step 2 (Enrichment): detected new step — clicking through")
+        await _screenshot(page, "step2_enrichment")
+        await _click_next_step(page)
+        await page.wait_for_timeout(1000)
+
+    # ── Wizard: Add tags ──
+    logger.info("Wizard: Adding 'Courthouse Data' tag...")
     await page.wait_for_timeout(1000)
+    await _dismiss_popups(page)  # clear notification popup before any interaction
     await _screenshot(page, "step2_tags")
 
     # Add "Courthouse Data" tag via the Custom Tags input on the right side
@@ -371,11 +392,13 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Tag addition failed: %s", e)
 
+    await _dismiss_popups(page)  # ensure popup is gone before advancing
     await _click_next_step(page)
 
-    # ── Wizard Step 3: Upload the file ──
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
+    # ── Wizard: Upload the file ──
+    logger.info("Wizard: Uploading CSV file: %s", csv_path.name)
     await page.wait_for_timeout(3000)
+    await _dismiss_popups(page)  # popup may reappear on new step
     await _screenshot(page, "step3_before_upload")
 
     try:
@@ -385,6 +408,7 @@ async def upload_csv(
             if await file_input.count() > 0:
                 break
             logger.debug("File input not found, waiting %dms...", wait)
+            await _dismiss_popups(page)
             await page.wait_for_timeout(wait)
             file_input = page.locator('input[type="file"]')
 
@@ -754,7 +778,8 @@ async def enrich_records(page: Page, list_name: str) -> dict:
             logger.error(result["message"])
             return result
 
-        # Click Manage dropdown
+        # Click Manage dropdown — dismiss aside overlay first (filter panel backdrop blocks clicks)
+        await _dismiss_popups(page)
         manage_btn = page.locator('button:has-text("Manage")')
         if await manage_btn.count() == 0:
             manage_btn = page.locator('text="Manage"')
@@ -861,7 +886,7 @@ async def enrich_records(page: Page, list_name: str) -> dict:
 
         # Enrichment runs in background — we don't need to wait for completion
         result["success"] = True
-        result["message"] = "Enrichment started — track progress in Activity → Action Page"
+        result["message"] = "Enrichment started - track progress in Activity > Action Page"
         logger.info(result["message"])
 
     except Exception as e:
@@ -899,6 +924,10 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         if not filtered:
             logger.warning("Could not filter to list for skip trace — continuing anyway")
 
+        # Dismiss any overlay left open by the filter panel before selecting
+        await _dismiss_popups(page)
+        await page.wait_for_timeout(1000)
+
         # Select all records
         selected = await _select_all_records(page)
         if not selected:
@@ -906,7 +935,8 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
             logger.error(result["message"])
             return result
 
-        # Click "Send To" dropdown
+        # Click "Send To" dropdown — dismiss aside overlay first
+        await _dismiss_popups(page)
         send_to_btn = page.locator('button:has-text("Send To")')
         if await send_to_btn.count() == 0:
             send_to_btn = page.locator('button:has-text("Send to")')
@@ -990,7 +1020,7 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
 
         # Skip trace runs in background — we don't need to wait
         result["success"] = True
-        result["message"] = "Skip trace started — track progress in Activity → Skip Trace tab"
+        result["message"] = "Skip trace started - track progress in Activity > Skip Trace tab"
         logger.info(result["message"])
 
     except Exception as e:

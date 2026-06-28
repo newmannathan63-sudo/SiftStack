@@ -22,8 +22,8 @@ USER_PROMPT_TEMPLATE = """\
 Extract the following fields from this {notice_type} legal notice published in {county} County, Tennessee.
 
 Return ONLY a JSON object with these exact keys:
-- "address": the property street address (e.g. "123 Main St"). NOT the courthouse, auction location, or trustee office address.
-- "city": the city where the property is located
+- "address": the property street address (e.g. "123 Main St"). NOT the courthouse, auction location, trustee office, or attorney address. If only a legal description (lot/block/plat) is given and no street address appears, use "".
+- "city": the city where the property is located. NOT a city from an attorney or law firm address.
 - "state": always "TN"
 - "zip": the 5-digit zip code of the property
 - "owner_name": the property owner, borrower, or grantor name(s). For foreclosures this is who executed the deed of trust. Use ALL CAPS as written in the notice.
@@ -148,11 +148,15 @@ _DIVORCE_KEYS = {
 _AUTO_DETECT_KEYS = {"notice_type", "confidence"}
 
 
+_STATE_NAMES = {"TN": "Tennessee", "FL": "Florida", "TX": "Texas", "GA": "Georgia"}
+
+
 async def extract_with_llm(
     raw_text: str,
     notice_type: str,
     county: str,
     api_key: str,
+    state: str = "TN",
 ) -> dict:
     """Call Claude Haiku to extract structured fields from notice text.
 
@@ -187,9 +191,24 @@ async def extract_with_llm(
         )
         expected = _FORECLOSURE_KEYS
 
+    # Adapt TN-specific prompt language for other states
+    if state != "TN":
+        state_name = _STATE_NAMES.get(state, state)
+        prompt = (
+            prompt
+            .replace("Tennessee", state_name)
+            .replace('"state": always "TN"', f'"state": always "{state}"')
+            .replace('"state": "TN"', f'"state": "{state}"')
+            .replace("County, Tennessee", f"County, {state_name}")
+            .replace('(usually "TN")', "(may be any state)")
+        )
+        system = SYSTEM_PROMPT.replace("Tennessee", state_name)
+    else:
+        system = SYSTEM_PROMPT
+
     try:
         parsed = await llm_client.chat_json_async(
-            prompt, system=SYSTEM_PROMPT, max_tokens=MAX_TOKENS, api_key=api_key,
+            prompt, system=system, max_tokens=MAX_TOKENS, api_key=api_key,
         )
 
         if not parsed:

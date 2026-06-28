@@ -203,7 +203,7 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
     """
     if filename is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        filename = f"tn_notices_{timestamp}.csv"
+        filename = f"notices_{timestamp}.csv"
 
     output_path = OUTPUT_DIR / filename
     written = 0

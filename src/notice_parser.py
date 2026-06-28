@@ -24,6 +24,30 @@ from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
 
+_STATE_ABBR: dict[str, str] = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
+    "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE",
+    "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI", "IDAHO": "ID",
+    "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS",
+    "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK",
+    "OREGON": "OR", "PENNSYLVANIA": "PA", "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD", "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT",
+    "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
+}
+
+
+def normalize_state_abbr(state: str) -> str:
+    """Convert full state name to 2-letter abbreviation. Pass-through if already abbreviated."""
+    s = state.strip()
+    if len(s) == 2:
+        return s.upper()
+    return _STATE_ABBR.get(s.upper(), s)
+
 
 @dataclass
 class NoticeData:
@@ -754,7 +778,7 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or "TN"
+                notice.owner_state = normalize_state_abbr(llm_result.get("owner_state") or "TN")
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
         else:

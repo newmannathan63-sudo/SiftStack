@@ -65,9 +65,17 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # ── Site URLs ──────────────────────────────────────────────────────────
+# Tennessee Public Notice (tnpublicnotice.com)
 BASE_URL = "https://www.tnpublicnotice.com"
 LOGIN_URL = f"{BASE_URL}/authenticate.aspx"
 SMART_SEARCH_URL = f"{BASE_URL}/Smartsearch/Default.aspx"
+
+# Jacksonville Daily Record — Duval County, FL (public, no login required)
+JDR_BASE_URL = "https://legals.jaxdailyrecord.com"
+JDR_SEARCH_URL = f"{JDR_BASE_URL}/legal_notices.php"
+
+# Duval County Clerk Official Records — lis pendens / preforeclosure (public, no login)
+DUVAL_CLERK_URL = os.getenv("DUVAL_CLERK_URL", "https://or.duvalclerk.com/")
 
 # ── ASP.NET Selectors ─────────────────────────────────────────────────
 # Login form
@@ -102,22 +110,30 @@ TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 
 # ── Notice Types ───────────────────────────────────────────────────────
-NOTICE_TYPES = ["foreclosure", "probate"]
+NOTICE_TYPES = ["foreclosure", "lis_pendens"]
 
 
 @dataclass
 class SavedSearch:
-    """Represents a saved search on tnpublicnotice.com."""
+    """Represents a saved search on any supported notice/records portal."""
     county: str
-    notice_type: str  # One of NOTICE_TYPES
-    saved_search_name: str  # Exact name in the Saved Searches dropdown
+    notice_type: str        # One of NOTICE_TYPES
+    saved_search_name: str  # Exact dropdown name (TNPN) or category label (JDR/duval_clerk)
+    source: str = "tnpn"    # "tnpn" | "jdr" | "duval_clerk"
 
 
 # ── Saved Searches ─────────────────────────────────────────────────────
-# These names must match exactly what appears in the dropdown on the site.
+# TNPN: names must match exactly what appears in the Smart Search dropdown.
+# JDR:  saved_search_name is the JDR category label used in the search form.
 SAVED_SEARCHES: list[SavedSearch] = [
-    SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
-    SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
+    # ── Florida (Duval County — legals.jaxdailyrecord.com) ───────────
+    SavedSearch("Duval", "foreclosure", "Notice of Sale - Foreclosure", source="jdr"),
+
+    # ── Florida (Duval County — or.duvalclerk.com Official Records) ──
+    # Lis Pendens = preforeclosure lawsuit filed against a property.
+    # Grantor = mortgagor (our target contact). Address may not be in the
+    # OR index — enrichment pipeline fills via Property Appraiser name lookup.
+    SavedSearch("Duval", "lis_pendens", "LIS PENDENS", source="duval_clerk"),
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────

@@ -7,16 +7,62 @@ Graceful degradation: if no API key or API errors, all notices pass through
 unchanged.
 """
 
+import json
 import logging
 import random
 import time
 from datetime import date, datetime
+from pathlib import Path
 
 import requests
 
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
+
+# ── Zillow cache ─────────────────────────────────────────────────────
+_CACHE_PATH = Path("output/zillow_cache.json")
+_CACHE_TTL_DAYS = 7
+
+
+def _cache_key(address: str, city: str, state: str, zip_code: str) -> str:
+    return f"{address}|{city}|{state}|{zip_code}".lower().strip()
+
+
+def _load_cache() -> dict:
+    if _CACHE_PATH.exists():
+        try:
+            with open(_CACHE_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    _CACHE_PATH.parent.mkdir(exist_ok=True)
+    with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+
+
+def _cache_get(cache: dict, address: str, city: str, state: str, zip_code: str) -> dict | None:
+    entry = cache.get(_cache_key(address, city, state, zip_code))
+    if not entry:
+        return None
+    try:
+        if (datetime.now() - datetime.fromisoformat(entry["ts"])).days > _CACHE_TTL_DAYS:
+            return None
+        return entry["data"]
+    except Exception:
+        return None
+
+
+def _cache_set(cache: dict, address: str, city: str, state: str, zip_code: str, data: dict) -> None:
+    cache[_cache_key(address, city, state, zip_code)] = {
+        "data": data,
+        "ts": datetime.now().isoformat(),
+    }
+
 
 # ── API Configuration ─────────────────────────────────────────────────
 API_BASE = "https://api.openwebninja.com/realtime-zillow-data"
@@ -333,19 +379,40 @@ def enrich_properties(
     skipped = len(notices) - len(eligible)
     equity_values: list[float] = []
 
+    cache = _load_cache()
+    cache_hits = 0
+    api_calls = 0
+
     for idx, (orig_idx, notice) in enumerate(eligible):
-        if idx > 0:
-            delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-            time.sleep(delay)
+        cached = _cache_get(cache, notice.address, notice.city, notice.state, notice.zip)
+        if cached is not None:
+            success = _apply_property_data(notice, cached)
+            if success:
+                enriched += 1
+                if notice.estimated_equity:
+                    try:
+                        equity_values.append(float(notice.estimated_equity))
+                    except ValueError:
+                        pass
+            else:
+                failed += 1
+            cache_hits += 1
+            continue
+
+        if api_calls > 0:
+            time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
         data = _fetch_property(
             notice.address, notice.city, notice.state, notice.zip,
             api_key,
         )
+        api_calls += 1
 
         if data is None:
             failed += 1
             continue
+
+        _cache_set(cache, notice.address, notice.city, notice.state, notice.zip, data)
 
         success = _apply_property_data(notice, data)
         if success:
@@ -360,17 +427,19 @@ def enrich_properties(
 
         if (idx + 1) % 10 == 0:
             logger.info(
-                "Zillow enrichment progress: %d/%d (enriched=%d, failed=%d)",
-                idx + 1, len(eligible), enriched, failed,
+                "Zillow enrichment progress: %d/%d (enriched=%d, failed=%d, cache_hits=%d)",
+                idx + 1, len(eligible), enriched, failed, cache_hits,
             )
+
+    _save_cache(cache)
 
     avg_equity = ""
     if equity_values:
         avg = sum(equity_values) / len(equity_values)
         avg_equity = f", avg equity=${avg:,.0f}"
     logger.info(
-        "Zillow enrichment complete: %d enriched, %d failed, %d skipped%s",
-        enriched, failed, skipped, avg_equity,
+        "Zillow enrichment complete: %d enriched, %d failed, %d skipped, %d cache hits%s",
+        enriched, failed, skipped, cache_hits, avg_equity,
     )
 
     return notices

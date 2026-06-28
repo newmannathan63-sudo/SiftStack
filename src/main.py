@@ -878,7 +878,9 @@ def _run_csv_import(args) -> None:
     logging.info("Output: %s", path)
 
     # DataSift upload (same logic as daily/historical mode)
-    if getattr(args, "upload_datasift", False):
+    _has_ds_creds = bool(config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD)
+    _want_ds_upload = (getattr(args, "upload_datasift", False) or _has_ds_creds) and not getattr(args, "no_upload_datasift", False)
+    if _want_ds_upload:
         from datasift_formatter import write_datasift_split_csvs
         from datasift_uploader import upload_datasift_split, upload_to_datasift
 
@@ -1288,7 +1290,12 @@ def cli_main() -> None:
     parser.add_argument(
         "--upload-datasift",
         action="store_true",
-        help="Upload results to DataSift.ai via Playwright (requires DATASIFT_EMAIL/PASSWORD)",
+        help="Upload results to DataSift.ai via Playwright (auto-enabled when DATASIFT_EMAIL/PASSWORD are set)",
+    )
+    parser.add_argument(
+        "--no-upload-datasift",
+        action="store_true",
+        help="Skip DataSift upload even if credentials are configured",
     )
     parser.add_argument(
         "--no-enrich",
@@ -1406,6 +1413,8 @@ def cli_main() -> None:
                         help="Property address (comp/rehab/analyze-deal modes)")
     parser.add_argument("--city", type=str, default=None,
                         help="Property city (comp/rehab/analyze-deal modes)")
+    parser.add_argument("--state", type=str, default=None,
+                        help="Property state abbreviation (comp/analyze-deal modes, default: TN)")
     parser.add_argument("--zip-code", type=str, default=None,
                         help="Property ZIP code (comp/rehab/analyze-deal modes)")
     parser.add_argument("--radius", type=float, default=0.5,
@@ -1525,8 +1534,8 @@ def cli_main() -> None:
             return
         from comp_analyzer import run_comp_analysis
         result = run_comp_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
-            radius=args.radius, months=args.months,
+            address=args.address, city=args.city or "", state=args.state or "TN",
+            zip_code=args.zip_code or "", radius=args.radius, months=args.months,
         )
         if "error" in result:
             logger.error("Comp analysis failed: %s", result["error"])
@@ -1767,10 +1776,29 @@ def cli_main() -> None:
 def _run_scrape_pipeline(args, searches) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
     from config import SEEN_IDS_FILE, load_state, save_state
+    from scraper import load_last_run_date, save_last_run_date
 
     tnpn_searches        = [s for s in searches if getattr(s, "source", "tnpn") == "tnpn"]
     jdr_searches         = [s for s in searches if getattr(s, "source", "tnpn") == "jdr"]
     duval_clerk_searches = [s for s in searches if getattr(s, "source", "tnpn") == "duval_clerk"]
+
+    # ── Resolve effective since_date for ALL scrapers ─────────────────
+    # --since flag takes top priority; otherwise daily mode reads last_run.json
+    # so every scraper (TNPN, JDR, Duval Clerk) uses the same date window.
+    # last_run.json is written at the end of this function to cover runs that
+    # skip TNPN entirely (e.g. --types lis_pendens).
+    effective_since: str | None = args.since
+    if effective_since is None and args.mode == "daily":
+        effective_since = load_last_run_date()
+        if effective_since:
+            logging.info("Daily mode: pulling notices since %s (from last_run.json)", effective_since)
+        else:
+            from datetime import timedelta
+            effective_since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            logging.info("Daily mode: no previous run on record — defaulting to last 7 days (%s)", effective_since)
+    elif args.mode == "historical":
+        from datetime import timedelta
+        effective_since = effective_since or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
 
     notices = []
 
@@ -1779,7 +1807,7 @@ def _run_scrape_pipeline(args, searches) -> None:
         tnpn_notices = asyncio.run(scrape_all(
             mode=args.mode, searches=tnpn_searches,
             llm_api_key=config.ANTHROPIC_API_KEY or None,
-            since_date_override=args.since,
+            since_date_override=effective_since,
             max_notices=args.max_notices,
         ))
         notices.extend(tnpn_notices)
@@ -1790,7 +1818,7 @@ def _run_scrape_pipeline(args, searches) -> None:
         seen_ids = load_state(SEEN_IDS_FILE)
         jdr_notices = asyncio.run(scrape_jdr_all(
             searches=jdr_searches,
-            since_date=args.since,
+            since_date=effective_since,
             seen_ids=seen_ids,
             llm_api_key=config.ANTHROPIC_API_KEY or None,
         ))
@@ -1803,12 +1831,17 @@ def _run_scrape_pipeline(args, searches) -> None:
         seen_ids = load_state(SEEN_IDS_FILE)
         dc_notices = asyncio.run(scrape_duval_clerk_all(
             searches=duval_clerk_searches,
-            since_date=args.since,
+            since_date=effective_since,
             seen_ids=seen_ids,
             llm_api_key=config.ANTHROPIC_API_KEY or None,
         ))
         save_state(SEEN_IDS_FILE, seen_ids)
         notices.extend(dc_notices)
+
+    # Always update last_run.json after a daily run — even if only DC/JDR ran
+    # (scrape_all writes it too for TNPN runs, but this covers DC/JDR-only runs)
+    if args.mode == "daily":
+        save_last_run_date()
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:
@@ -1929,9 +1962,11 @@ def _run_scrape_pipeline(args, searches) -> None:
         except Exception:
             logging.exception("Report generator import failed")
 
-    # DataSift upload
+    # DataSift upload — auto-enabled when credentials are present
     upload_result = None
-    if getattr(args, "upload_datasift", False):
+    _has_ds_creds = bool(config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD)
+    _want_ds_upload = (getattr(args, "upload_datasift", False) or _has_ds_creds) and not getattr(args, "no_upload_datasift", False)
+    if _want_ds_upload:
         from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
         from datasift_uploader import upload_to_datasift, upload_datasift_split
 

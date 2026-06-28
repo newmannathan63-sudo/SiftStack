@@ -210,16 +210,16 @@ def _split_name(full_name: str) -> tuple[str, str]:
     return _clean_and_split_name(full_name)
 
 
-# Map notice_type → DataSift list name for niche sequential marketing.
-# DataSift auto-creates lists from CSV if they don't exist yet.
+# All records go into the FTM (First-to-Market) list.
+# Notice type is preserved via Tags and the "Notice Type" custom field.
 NOTICE_TYPE_TO_LIST = {
-    "foreclosure": "Foreclosure",
-    "probate": "Probate",
-    "tax_sale": "Tax Sale",
-    "tax_delinquent": "Tax Delinquent",
-    "eviction": "Eviction",
-    "code_violation": "Code Violation",
-    "divorce": "Divorce",
+    "foreclosure": "FTM",
+    "probate": "FTM",
+    "tax_sale": "FTM",
+    "tax_delinquent": "FTM",
+    "eviction": "FTM",
+    "code_violation": "FTM",
+    "divorce": "FTM",
 }
 
 

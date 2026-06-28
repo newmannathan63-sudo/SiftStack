@@ -411,3 +411,10 @@ plugin-name.plugin (ZIP containing):
 │       └── references/
 └── README.md
 ```
+
+## My Defaults
+
+- **Primary county:** Duval County, Florida
+- **Daily summaries:** Send to Slack `#FTM-pull` channel
+- **Preferred run time:** 9:00 AM daily
+- **Dispositions DataSift list:** `FTM`

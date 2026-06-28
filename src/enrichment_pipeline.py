@@ -402,6 +402,30 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  Probate property lookup failed: %s", e)
 
+    # ── Step 3d: Lis Pendens Address Lookup (Duval County DCPA) ─────
+    # Duval Clerk OR index has no street address — look up by grantor name
+    # via the Duval County Property Appraiser public search.
+    lp_no_addr = [
+        n for n in notices
+        if n.notice_type == "lis_pendens"
+        and n.county.lower() == "duval"
+        and not n.address.strip()
+        and n.owner_name.strip()
+    ]
+    if lp_no_addr:
+        logger.info("── Step 3d: Lis Pendens Address Lookup (%d candidates) ──", len(lp_no_addr))
+        try:
+            from tax_enricher import _lis_pendens_address_lookup
+            _lis_pendens_address_lookup(lp_no_addr)
+            found = sum(1 for n in lp_no_addr if n.address.strip())
+            logger.info("  Address found: %d/%d", found, len(lp_no_addr))
+        except ImportError:
+            logger.warning("  _lis_pendens_address_lookup not available — skipping")
+        except Exception as e:
+            logger.warning("  Lis pendens address lookup failed: %s", e)
+    else:
+        logger.info("── Step 3d: Lis Pendens Address Lookup (no candidates) ──")
+
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
     if not opts.skip_parcel_lookup and not opts.skip_tax:
         candidates = [

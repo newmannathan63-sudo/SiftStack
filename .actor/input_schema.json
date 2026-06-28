@@ -2,7 +2,7 @@
     "title": "SiftStack Input",
     "type": "object",
     "schemaVersion": 1,
-    "required": ["mode", "tn_username", "tn_password", "captcha_api_key"],
+    "required": ["mode"],
     "properties": {
         "mode": {
             "title": "Scrape Mode",
@@ -15,17 +15,17 @@
         "counties": {
             "title": "Counties",
             "type": "array",
-            "description": "Counties to scrape. Leave empty for all (Knox + Blount).",
+            "description": "Counties to scrape. E.g. [\"Duval\"] for FL or [\"Knox\", \"Blount\"] for TN. Leave empty for all configured counties.",
             "items": { "type": "string" },
-            "default": [],
+            "default": ["Duval"],
             "editor": "stringList"
         },
         "types": {
             "title": "Notice Types",
             "type": "array",
-            "description": "Notice types to scrape. Currently only foreclosure is supported.",
+            "description": "Notice types to scrape: foreclosure, probate, tax_sale, tax_delinquent, eviction, code_violation, divorce. Leave empty for all.",
             "items": { "type": "string" },
-            "default": ["foreclosure"],
+            "default": [],
             "editor": "stringList"
         },
         "since_date": {

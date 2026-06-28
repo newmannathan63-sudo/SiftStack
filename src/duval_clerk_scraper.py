@@ -507,6 +507,11 @@ async def _try_export_csv(page: Page) -> list[tuple[str, str]] | None:
                 if not defendant:
                     continue
 
+                # DocLink may be a relative or absolute URL to the document viewer
+                doc_link = (row.get("DocLink") or "").strip()
+                if doc_link and not doc_link.startswith("http"):
+                    doc_link = f"{DUVAL_CLERK_BASE_URL}/{doc_link.lstrip('/')}"
+
                 # Grantor = defendant (property owner), Grantee = plaintiff (lender)
                 row_text = (
                     f"Grantor: {defendant}\n"
@@ -516,6 +521,8 @@ async def _try_export_csv(page: Page) -> list[tuple[str, str]] | None:
                     f"Book/Page: {book_page}\n"
                     f"Legal: {legal}"
                 )
+                if doc_link:
+                    row_text += f"\nDoc Link: {doc_link}"
                 results.append((rec_date, row_text))
 
         logger.info("DuvalClerk: CSV export yielded %d records", len(results))
@@ -582,6 +589,17 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
             book_page    = texts[7] if len(texts) > 7 else ""
             legal        = texts[10] if len(texts) > 10 else ""
 
+            # Capture the actual href from the DocLink cell's <a> tag
+            doc_link = ""
+            if len(cells) > 8:
+                link_el = await cells[8].query_selector("a")
+                if link_el:
+                    href = await link_el.get_attribute("href") or ""
+                    if href:
+                        if not href.startswith("http"):
+                            href = f"{DUVAL_CLERK_BASE_URL}/{href.lstrip('/')}"
+                        doc_link = href
+
             if not defendant or "no results" in defendant.lower():
                 continue
 
@@ -594,6 +612,8 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
                 f"Book/Page: {book_page}\n"
                 f"Legal: {legal}"
             )
+            if doc_link:
+                row_text += f"\nDoc Link: {doc_link}"
             results.append((rec_date, row_text))
         except Exception:
             continue
