@@ -868,6 +868,27 @@ def _lis_pendens_address_lookup(notices: list["NoticeData"]) -> None:
 
     logger.info("  DCPA address lookup for %d lis pendens grantor(s)", len(candidates))
 
+    # sync_playwright() cannot be called from within a running asyncio event loop
+    # (e.g. inside the Apify actor). Detect this and run the entire lookup in a
+    # separate thread, which has no event loop attached.
+    try:
+        import asyncio as _asyncio
+        _asyncio.get_running_loop()
+        _in_async = True
+    except RuntimeError:
+        _in_async = False
+
+    if _in_async:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(_lis_pendens_address_lookup_impl, candidates).result()
+        return
+
+    _lis_pendens_address_lookup_impl(candidates)
+
+
+def _lis_pendens_address_lookup_impl(candidates: list) -> None:
+    """Core DCPA lookup implementation — must run in a thread-safe, non-async context."""
     dcpa_page = None
     dcpa_browser = None
     dcpa_pw_ctx = None
