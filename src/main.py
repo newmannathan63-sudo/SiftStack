@@ -188,6 +188,9 @@ async def actor_main() -> None:
         # Pipeline toggles
         do_tracerfy = actor_input.get("run_tracerfy", True)
         do_notify_slack = actor_input.get("notify_slack", True)
+        do_ds_upload = actor_input.get("upload_datasift", True)
+        do_enrich_ds = actor_input.get("enrich_datasift", True)
+        do_skip_trace_ds = actor_input.get("skip_trace_datasift", True)
 
         # Buy box / filter toggles
         include_vacant = actor_input.get("include_vacant", False)
@@ -516,11 +519,10 @@ async def actor_main() -> None:
             elif drive_folder_id:
                 Actor.log.warning("google_drive_folder_id set but google_service_account_key missing — skipping Drive upload")
 
-            # ── DataSift CSVs → KVS (manual upload) ─────────────────
-            # Generate DataSift-formatted CSVs and save to Apify KVS
-            # for manual download + upload to DataSift (more reliable than
-            # automated Playwright upload in headless cloud containers).
+            # ── DataSift CSVs → Generate + Upload ────────────────────
             datasift_csv_urls = []
+            datasift_upload_result: dict = {}
+            csv_infos: list[dict] = []
             try:
                 from datasift_formatter import write_datasift_split_csvs
 
@@ -530,13 +532,33 @@ async def actor_main() -> None:
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
                     with open(info["path"], "rb") as f:
                         await kvs.set_value(key, f.read(), content_type="text/csv")
-                    # Build public download URL
                     kvs_id = kvs._id if hasattr(kvs, '_id') else ''
                     url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
                     datasift_csv_urls.append({"label": info["label"], "url": url, "records": info.get("count", "?")})
                     Actor.log.info("DataSift CSV (%s) saved to KVS: %s", info["label"], key)
             except Exception as e:
                 Actor.log.error("DataSift CSV generation failed: %s", e)
+
+            # ── DataSift Automated Upload ─────────────────────────────
+            if do_ds_upload and csv_infos and config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD:
+                try:
+                    from datasift_uploader import upload_datasift_split
+                    Actor.log.info("Uploading %d CSV(s) to DataSift...", len(csv_infos))
+                    datasift_upload_result = await upload_datasift_split(
+                        csv_infos,
+                        enrich=do_enrich_ds,
+                        skip_trace=do_skip_trace_ds,
+                        existing_list=True,
+                    )
+                    Actor.log.info(
+                        "DataSift upload: %s",
+                        datasift_upload_result.get("message", "OK"),
+                    )
+                except Exception as e:
+                    Actor.log.error("DataSift upload failed: %s", e)
+                    datasift_upload_result = {"success": False, "message": str(e)}
+            elif do_ds_upload and not config.DATASIFT_EMAIL:
+                Actor.log.warning("upload_datasift=true but datasift_email/password not set — skipping")
 
             # ── Slack Notification ────────────────────────────────────
             elapsed_min = (_time() - pipeline_start) / 60
@@ -574,11 +596,29 @@ async def actor_main() -> None:
                         cost_breakdown=cost_breakdown,
                     )
 
-                    # Send DataSift CSV download links as a follow-up message
-                    if datasift_csv_urls:
-                        csv_lines = [
-                            "*DataSift CSVs ready for manual upload:*",
-                        ]
+                    # Send DataSift upload status
+                    if datasift_upload_result:
+                        if datasift_upload_result.get("success"):
+                            ds_lines = ["*DataSift upload: ✓ complete*"]
+                            uploads = datasift_upload_result.get("uploads", [])
+                            for u in uploads:
+                                label = u.get("label", u.get("list_name", ""))
+                                ds_lines.append(f"  • {label}: uploaded")
+                            if datasift_upload_result.get("enrich_result", {}).get("success"):
+                                ds_lines.append("  • Enrichment: queued")
+                            if datasift_upload_result.get("skip_trace_result", {}).get("success"):
+                                ds_lines.append("  • Skip trace: queued")
+                        else:
+                            msg = datasift_upload_result.get("message", "unknown error")
+                            ds_lines = [
+                                f"*DataSift upload: ✗ failed* — {msg}",
+                                "*CSVs available for manual upload:*",
+                            ]
+                            for csv_info in datasift_csv_urls:
+                                ds_lines.append(f"  <{csv_info['url']}|{csv_info['label']}> ({csv_info['records']} records)")
+                        _send_webhook("\n".join(ds_lines))
+                    elif datasift_csv_urls:
+                        csv_lines = ["*DataSift CSVs ready for manual upload:*"]
                         for csv_info in datasift_csv_urls:
                             csv_lines.append(f"  <{csv_info['url']}|{csv_info['label']}> ({csv_info['records']} records)")
                         csv_lines.append("_Upload at app.reisift.io → Upload File → Add Data_")
