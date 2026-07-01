@@ -31,6 +31,7 @@ SIFT_COLUMNS = [
     "county",
     "decedent_name",
     "auction_date",
+    "plaintiff",
     # Smarty address standardization fields
     "zip_plus4",
     "latitude",
@@ -231,6 +232,7 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "county": notice.county,
                 "decedent_name": notice.decedent_name,
                 "auction_date": _format_date_sift(notice.auction_date),
+                "plaintiff": notice.plaintiff,
                 "zip_plus4": notice.zip_plus4,
                 "latitude": notice.latitude,
                 "longitude": notice.longitude,

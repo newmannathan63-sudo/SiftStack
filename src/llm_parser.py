@@ -127,8 +127,26 @@ Return ONLY a JSON object with these exact keys:
 Document text:
 {raw_text}"""
 
+FL_FORECLOSURE_PROMPT_TEMPLATE = """\
+Extract the following fields from this foreclosure legal notice published in {county} County, Florida.
+
+Return ONLY a JSON object with these exact keys:
+- "address": the property street address (e.g. "123 Main St"). NOT the courthouse, auction location, trustee office, or attorney address. If only a legal description (lot/block/plat) is given and no street address appears, use "".
+- "city": the city where the property is located. NOT a city from an attorney or law firm address.
+- "state": always "FL"
+- "zip": the 5-digit zip code of the property
+- "owner_name": the defendant/borrower name(s). For FL foreclosures this is who the bank is suing (the homeowner). Use ALL CAPS as written in the notice. Exclude "et al." and bank/lender names.
+- "auction_date": the scheduled sale/auction date in YYYY-MM-DD format. This is the date the property will be sold at auction, NOT the publication date of the notice.
+- "plaintiff": the lender or bank name (the Plaintiff in the case). Use ALL CAPS as written. This is typically a bank, mortgage company, or loan servicer. Use the full legal name.
+
+If a field cannot be determined from the text, use an empty string "".
+
+Notice text:
+{raw_text}"""
+
 # Keys expected from each prompt type
 _FORECLOSURE_KEYS = {"address", "city", "state", "zip", "owner_name", "auction_date"}
+_FL_FORECLOSURE_KEYS = {"address", "city", "state", "zip", "owner_name", "auction_date", "plaintiff"}
 _PROBATE_KEYS = {
     "decedent_name", "owner_name", "owner_street", "owner_city",
     "owner_state", "owner_zip", "address", "city", "state", "zip",
@@ -184,6 +202,10 @@ async def extract_with_llm(
     if notice_type in prompt_map:
         template, expected = prompt_map[notice_type]
         prompt = template.format(county=county, raw_text=text)
+    elif notice_type == "foreclosure" and state == "FL":
+        # FL judicial foreclosures have a Plaintiff (lender) — use FL-specific prompt
+        prompt = FL_FORECLOSURE_PROMPT_TEMPLATE.format(county=county, raw_text=text)
+        expected = _FL_FORECLOSURE_KEYS
     else:
         # Default: foreclosure / tax_sale / tax_delinquent
         prompt = USER_PROMPT_TEMPLATE.format(

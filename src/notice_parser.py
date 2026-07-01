@@ -154,6 +154,8 @@ class NoticeData:
     email_3: str = ""
     email_4: str = ""
     email_5: str = ""
+    # Foreclosure-specific fields
+    plaintiff: str = ""               # Lender/plaintiff name from FL judicial foreclosure notice
     # Pipeline metadata (set by enrichment_pipeline)
     run_id: str = ""                   # Unique pipeline run identifier for data lineage
 

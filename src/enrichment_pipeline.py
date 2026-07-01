@@ -110,13 +110,15 @@ def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
         return int(m.group(1)) > 0
 
     before = len(notices)
-    # Probate and lis_pendens notices have no property address by design —
-    # probate comes from court records, lis_pendens from the OR index (grantor name only).
+    # Probate and lis_pendens notices have no property address by design.
+    # FL foreclosures with only a legal description (no street address) are kept
+    # for deeper research — flagged as no_property_address in missing_data_flags.
     result = [
         n for n in notices
         if _has_house_number(n.address)
         or (n.notice_type == "probate" and n.owner_street.strip())
         or n.notice_type == "lis_pendens"
+        or (n.notice_type == "foreclosure" and not n.address.strip())
     ]
     removed = before - len(result)
     if removed:
@@ -246,8 +248,20 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
             n.notice_type == "lis_pendens"
             and not n.address.strip()
         )
+        # FL judicial foreclosures sometimes have only a legal description (lot/block/plat)
+        # with no street address. Keep them for deeper research — flag instead of drop.
+        is_foreclosure_no_addr = (
+            n.notice_type == "foreclosure"
+            and not n.address.strip()
+        )
+        if is_foreclosure_no_addr:
+            flags = n.missing_data_flags.split("|") if n.missing_data_flags else []
+            if "no_property_address" not in flags:
+                flags.append("no_property_address")
+            n.missing_data_flags = "|".join(flags)
+            n.mailable = ""
 
-        if not is_probate_no_addr and not is_lis_pendens_no_addr:
+        if not is_probate_no_addr and not is_lis_pendens_no_addr and not is_foreclosure_no_addr:
             # Required fields
             if not n.address.strip():
                 issues.append("missing address")

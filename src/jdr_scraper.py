@@ -478,6 +478,8 @@ def _apply_llm(notice: NoticeData, result: dict) -> None:
             notice.owner_name = result["owner_name"]
         if not notice.auction_date and result.get("auction_date"):
             notice.auction_date = result["auction_date"]
+        if result.get("plaintiff"):
+            notice.plaintiff = result["plaintiff"]
 
 
 # ── Playwright form interaction ───────────────────────────────────────
@@ -825,13 +827,12 @@ async def _scrape_jdr_search(
             if nhash in seen_ids:
                 logger.debug("  Skipping seen notice hash=%s", nhash)
                 continue
-            effective_date = pub_date or start
-            if since_date and effective_date and effective_date < since_date:
-                logger.debug(
-                    "  Skipping old notice (pub_date=%s < since=%s)",
-                    effective_date, since_date,
-                )
-                continue
+            # Use the search start date as date_added — JDR's search already
+            # filters by date, so all returned records belong to the search window.
+            # Parsed notice text dates (FIRST_PUB_RE) reflect the *first* publication
+            # date, which can be earlier for two-run notices (e.g. Jun 22 + Jun 29).
+            # Skipping on that parsed date would drop valid second-publication records.
+            effective_date = start
             notice = _parse_jdr_notice(block_text, search, effective_date or today, seq_base + i + 1)
             pending.append((nhash, notice, block_text))
 

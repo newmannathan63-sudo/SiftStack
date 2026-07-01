@@ -236,7 +236,7 @@ def _build_tags(notice: NoticeData) -> str:
     - DM confidence level (for deceased records)
     - has_auction if auction date is upcoming
     """
-    tags = ["Courthouse Data"]
+    tags = ["Courthouse Data", "FTM"]
 
     # Notice type
     if notice.notice_type:
@@ -523,6 +523,8 @@ def _build_property_section(notice: NoticeData) -> str:
     if notice.notice_type:
         parts.append(notice.notice_type.replace("_", " ").title())
 
+    if notice.plaintiff:
+        parts.append(f"Lender: {notice.plaintiff}")
     if notice.auction_date:
         parts.append(f"Auction: {_format_date(notice.auction_date)}")
 

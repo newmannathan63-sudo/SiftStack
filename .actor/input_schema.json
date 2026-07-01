@@ -25,7 +25,7 @@
             "type": "array",
             "description": "Notice types to scrape: foreclosure, probate, tax_sale, tax_delinquent, eviction, code_violation, divorce, lis_pendens. Leave empty for all.",
             "items": { "type": "string" },
-            "default": ["lis_pendens"],
+            "default": ["lis_pendens", "foreclosure"],
             "editor": "stringList"
         },
         "since_date": {
