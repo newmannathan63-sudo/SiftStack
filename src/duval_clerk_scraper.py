@@ -536,20 +536,20 @@ async def _try_export_csv(page: Page) -> list[tuple[str, str]] | None:
 async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
     """Extract (recorded_date, row_text) tuples from the OR results page.
 
-    Tries CSV export first (gets all records at once). Falls back to HTML
-    table scraping if the export button is absent or fails.
+    Uses HTML table scraping as primary. The CSV export is limited to records
+    at or below the "Released through Instrument Number" shown in the site banner,
+    which lags 3-4 days behind current filings. The HTML table returns ALL records
+    including those past the release threshold, so recently-filed LP records are
+    captured without waiting for the official release cycle.
+
+    Falls back to CSV export only if the HTML table yields nothing.
 
     Verified table column order (2026-06-11):
       R# | First Direct Name | First Indirect Name | Instrument # |
       Record Date | Doc Type | Book Type | Book/Page | Doc Link |
       Consideration | Legal | DeletedAfter
     """
-    # Prefer CSV — avoids pagination entirely
-    csv_rows = await _try_export_csv(page)
-    if csv_rows is not None:
-        return csv_rows
-
-    # Fallback: scrape the Kendo grid HTML table
+    # Primary: scrape the Kendo grid HTML table (includes unreleased records)
     # The Kendo grid renders as a <table> inside a div.k-grid-content
     table_selectors = [
         ".k-grid-content table",
@@ -566,8 +566,9 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
             break
 
     if not result_tbl:
-        logger.warning("DuvalClerk: results table not found and CSV export unavailable")
-        return []
+        logger.info("DuvalClerk: HTML table not found — falling back to CSV export")
+        csv_rows = await _try_export_csv(page)
+        return csv_rows or []
 
     rows = await result_tbl.query_selector_all("tr")
     results: list[tuple[str, str]] = []
@@ -578,21 +579,27 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
                 continue
             texts = [(await c.inner_text()).replace("\xa0", " ").strip() for c in cells]
 
-            # Column order (verified 2026-06-12):
-            # 0:R# | 1:DirectName (plaintiff) | 2:IndirectName (defendant/owner) |
-            # 3:InstrumentNumber | 4:RecordDate | 5:DocTypeDescription | 6:BookType |
-            # 7:BookPage | 8:DocLink | 9:Consideration | 10:DocLegalDescription | 11:DeletedAfterVerify
-            plaintiff    = texts[1] if len(texts) > 1 else ""
-            defendant    = texts[2] if len(texts) > 2 else ""
-            instrument   = texts[3] if len(texts) > 3 else ""
-            rec_date_raw = texts[4].split(" ")[0] if len(texts) > 4 else ""  # strip time
-            book_page    = texts[7] if len(texts) > 7 else ""
-            legal        = texts[10] if len(texts) > 10 else ""
+            # Kendo grid inserts a hidden checkbox/select cell at index 0, shifting
+            # all visible columns right by 1. Detect this by checking whether texts[4]
+            # matches a date (M/D/YYYY). If not, assume the +1 offset applies.
+            # Visual column order: R# | DirectName | IndirectName | Instrument# | RecordDate | ...
+            _DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}")
+            _offset = 0
+            if len(texts) > 4 and not _DATE_RE.match(texts[4]):
+                # texts[4] is not a date — hidden column present, shift indices +1
+                _offset = 1
+
+            plaintiff    = texts[1 + _offset] if len(texts) > 1 + _offset else ""
+            defendant    = texts[2 + _offset] if len(texts) > 2 + _offset else ""
+            instrument   = texts[3 + _offset] if len(texts) > 3 + _offset else ""
+            rec_date_raw = texts[4 + _offset].split(" ")[0] if len(texts) > 4 + _offset else ""
+            book_page    = texts[7 + _offset] if len(texts) > 7 + _offset else ""
+            legal        = texts[10 + _offset] if len(texts) > 10 + _offset else ""
 
             # Capture the actual href from the DocLink cell's <a> tag
             doc_link = ""
-            if len(cells) > 8:
-                link_el = await cells[8].query_selector("a")
+            if len(cells) > 8 + _offset:
+                link_el = await cells[8 + _offset].query_selector("a")
                 if link_el:
                     href = await link_el.get_attribute("href") or ""
                     if href:
@@ -618,7 +625,7 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
         except Exception:
             continue
 
-    logger.debug("DuvalClerk: extracted %d rows from HTML table", len(results))
+    logger.info("DuvalClerk: extracted %d rows from HTML table (includes unreleased records)", len(results))
     return results
 
 
@@ -669,14 +676,176 @@ async def _click_next_page(page: Page) -> bool:
 # ── Per-search scraping ───────────────────────────────────────────────
 
 
+async def _parse_released_through_date(page: Page) -> str | None:
+    """Extract 'Released through date' from the OR index page banner.
+
+    The banner reads: "Released through date: MM/DD/YYYY | ..."
+    Returns ISO date string (YYYY-MM-DD) or None if not found.
+    """
+    try:
+        body = await page.inner_text("body")
+        m = re.search(r"Released through date:\s*(\d{1,2}/\d{1,2}/\d{4})", body)
+        if m:
+            return _norm_date(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+async def _set_kendo_date_via_js(page: Page, name: str, value_mdy: str) -> bool:
+    """Set a Kendo DatePicker via its JavaScript widget API.
+
+    Kendo DatePicker stores its internal state in a JS widget object separate
+    from the HTML input value.  Plain Playwright fill() + Tab updates the visible
+    input but may not trigger the widget's internal state update, so a subsequent
+    Search click uses the old (or empty) date.  This function uses the Kendo JS
+    API directly to set the widget value and fires the change event so the Search
+    button picks up the new date.
+    """
+    result = await page.evaluate("""
+        (args) => {
+            const input = document.querySelector(args.sel);
+            if (!input) return 'no-input';
+
+            // Try Kendo widget instance via jQuery .data() (most reliable)
+            if (window.$ && $(input).data) {
+                try {
+                    const kw = $(input).data('kendoDatePicker');
+                    if (kw) {
+                        kw.value(new Date(args.val));
+                        kw.trigger('change');
+                        return 'kendo-api-' + (kw.value() ? kw.value().toLocaleDateString() : 'null');
+                    }
+                } catch(e) {}
+            }
+
+            // Try kendo.widgetInstance() fallback
+            if (window.kendo && kendo.widgetInstance) {
+                try {
+                    const kw = kendo.widgetInstance(input);
+                    if (kw) {
+                        kw.value(new Date(args.val));
+                        kw.trigger('change');
+                        return 'kendo-instance-ok';
+                    }
+                } catch(e) {}
+            }
+
+            // Last resort: native setter + bubbling events (React/Kendo hybrid)
+            try {
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(input, args.val);
+                input.dispatchEvent(new Event('input',  {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'native-setter';
+            } catch(e) {
+                return 'error: ' + e.message;
+            }
+        }
+    """, {"sel": f"input[name='{name}']", "val": value_mdy})
+    logger.debug("DuvalClerk: _set_kendo_date_via_js name=%s val=%s → %s", name, value_mdy, result)
+    return not (result or "").startswith("error") and result != "no-input"
+
+
+async def _resubmit_search_dates(page: Page, start: str, end: str) -> bool:
+    """Update date inputs on the current results page and re-click Search.
+
+    Uses Kendo's JS widget API to update DatePicker internal state so the
+    Search button uses the new dates, not just the visible input value.
+    """
+    try:
+        start_mdy = _to_mdy(start)
+        end_mdy   = _to_mdy(end)
+
+        # Set dates via Kendo JS API (most reliable) + visible input fallback
+        for name, val in [("RecordDateFrom", start_mdy), ("RecordDateTo", end_mdy)]:
+            js_ok = await _set_kendo_date_via_js(page, name, val)
+            if not js_ok:
+                # Fallback: Playwright fill + Tab
+                el = page.locator(f"input[name='{name}']").first
+                await el.click(click_count=3)
+                await el.fill(val)
+                await el.press("Tab")
+            logger.debug("DuvalClerk: set %s = %s (js_ok=%s)", name, val, js_ok)
+
+        await page.wait_for_timeout(300)
+
+        # Re-click Search
+        for btn_sel in ["button:has-text('Search')", "input[type='submit'][value='Search']"]:
+            try:
+                await page.click(btn_sel, timeout=3_000)
+                break
+            except Exception:
+                continue
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except PwTimeout:
+            pass
+        await _delay()
+
+        # Log page snippet so we can diagnose whether results changed
+        try:
+            snippet = (await page.inner_text("body"))[:300].replace("\n", " ").strip()
+            logger.info("DuvalClerk: resubmit %s→%s page text: %s", start, end, snippet)
+        except Exception:
+            pass
+
+        return True
+    except Exception as exc:
+        logger.warning("DuvalClerk: resubmit failed: %s", exc)
+        return False
+
+
+async def _collect_rows_from_search(
+    page: Page, start: str, end: str, navigate: bool = True
+) -> list[tuple[str, str]]:
+    """Submit a search for [start, end] and return all (rec_date, row_text) pairs.
+
+    navigate=True (default): calls _submit_search_form which does page.goto first.
+    navigate=False: stays on the current results page and just updates date inputs.
+    """
+    if navigate:
+        ok = await _submit_search_form(page, start, end)
+    else:
+        ok = await _resubmit_search_dates(page, start, end)
+    if not ok:
+        return []
+    all_rows: list[tuple[str, str]] = []
+    page_num = 0
+    while True:
+        page_num += 1
+        rows = await _extract_index_rows(page)
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if not await _click_next_page(page):
+            break
+    return all_rows
+
+
 async def _scrape_duval_clerk_search(
     page: Page,
     search: SavedSearch,
     since_date: str | None,
     seen_ids: dict[str, str],
     llm_api_key: str | None,
-) -> list[NoticeData]:
-    """Run one lis pendens date-range search and return all NoticeData."""
+    last_released_through: str | None = None,
+) -> tuple[list[NoticeData], str | None]:
+    """Run one lis pendens date-range search and return (notices, released_through).
+
+    Strategy: the Duval Clerk's date-range search only returns officially
+    "released" records (up to the Released-through Instrument Number). Records
+    filed in the last 3-5 days are visible on the site but excluded from searches
+    until the Clerk processes them and advances the released-through date.
+
+    Catch-up logic: if `last_released_through` is supplied and the current
+    released-through date has advanced, we run an additional search for the
+    newly-released period (last_released_through+1 → current_released_through).
+    This ensures records that became released since the last run are captured.
+    """
     logger.info(
         "DuvalClerk scraping: county=%s type=%s since=%s",
         search.county, search.notice_type, since_date or "all",
@@ -685,127 +854,139 @@ async def _scrape_duval_clerk_search(
     today = datetime.now().strftime("%Y-%m-%d")
     start = since_date or (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    ok = await _submit_search_form(page, start, today)
-    if not ok:
-        logger.error("DuvalClerk form submission failed")
-        return []
+    # ── Main range search (released records in [start, today]) ───────
+    all_rows: list[tuple[str, str]] = await _collect_rows_from_search(page, start, today)
+
+    # Parse the released-through date so we can persist it and detect changes.
+    released_through = await _parse_released_through_date(page)
+    if released_through:
+        logger.info("  DuvalClerk: Released-through date = %s", released_through)
+
+    # ── Catch-up: newly-released records from the previous gap ───────
+    # If the released-through date has advanced since our last run, records
+    # that were previously unreleased (and thus invisible to date-range
+    # searches) may now be accessible.  Run a supplemental search for the
+    # newly-released window as long as it doesn't overlap our main range
+    # (which already covers start→today).
+    if released_through and last_released_through and released_through > last_released_through:
+        catch_start = (
+            datetime.strptime(last_released_through, "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        catch_end = released_through
+        if catch_start < start:
+            logger.info(
+                "  DuvalClerk: catch-up search for newly-released records %s → %s",
+                catch_start, catch_end,
+            )
+            catch_rows = await _collect_rows_from_search(
+                page, catch_start, catch_end, navigate=False
+            )
+            if catch_rows:
+                sample_dates = sorted({r[0] for r in catch_rows if r[0]})
+                logger.info(
+                    "  DuvalClerk: catch-up returned %d rows (dates: %s)",
+                    len(catch_rows), sample_dates[:5],
+                )
+                all_rows.extend(catch_rows)
 
     notices: list[NoticeData] = []
-    page_num = 0
 
-    while True:
-        page_num += 1
-        total = await _get_result_count(page)
+    if not all_rows:
         logger.info(
-            "  DuvalClerk page %d — total results: %s",
-            page_num, str(total) if total is not None else "?",
+            "  DuvalClerk %s/%s: no rows found — "
+            "no results for this date range or selectors need updating",
+            search.county, search.notice_type,
         )
 
-        rows = await _extract_index_rows(page)
-        if not rows:
-            if page_num == 1:
-                logger.info(
-                    "  DuvalClerk %s/%s: no rows on page 1 — "
-                    "no results for this date range or selectors need updating",
-                    search.county, search.notice_type,
-                )
-            break
+    logger.info("  Parsing %d total rows", len(all_rows))
 
-        logger.info("  Parsing %d rows from page %d", len(rows), page_num)
-        seq_base = (page_num - 1) * RESULTS_PER_PAGE
+    # First pass: filter + parse all rows
+    pending: list[tuple[str, NoticeData, str]] = []
+    skipped_non_mortgage = 0
+    for i, (rec_date, row_text) in enumerate(all_rows):
+        gm = LP_GRANTOR_RE.search(row_text)
+        bm = LP_BOOK_PAGE_RE.search(row_text)
+        defendant = _clean(gm.group(1)) if gm else row_text[:40]
 
-        # First pass: filter + parse all new rows
-        pending: list[tuple[str, NoticeData, str]] = []
-        skipped_non_mortgage = 0
-        for i, (rec_date, row_text) in enumerate(rows):
-            # Extract defendant (property owner) and plaintiff (lender) for filter + dedup
-            # Grantor: line = defendant (property owner); Grantee: line = plaintiff (lender)
-            gm = LP_GRANTOR_RE.search(row_text)
-            bm = LP_BOOK_PAGE_RE.search(row_text)
-            defendant = _clean(gm.group(1)) if gm else row_text[:40]
+        plaintiff_m = re.search(r"^Grantee:\s*(.+)$", row_text, re.MULTILINE)
+        plaintiff = _clean(plaintiff_m.group(1)) if plaintiff_m else ""
 
-            plaintiff_m = re.search(r"^Grantee:\s*(.+)$", row_text, re.MULTILINE)
-            plaintiff = _clean(plaintiff_m.group(1)) if plaintiff_m else ""
+        if not _is_mortgage_preforeclosure(plaintiff, defendant):
+            skipped_non_mortgage += 1
+            logger.debug(
+                "  Skipping non-mortgage LP: defendant=%s plaintiff=%s",
+                defendant[:40], plaintiff[:40],
+            )
+            continue
 
-            if not _is_mortgage_preforeclosure(plaintiff, defendant):
-                skipped_non_mortgage += 1
-                logger.debug(
-                    "  Skipping non-mortgage LP: defendant=%s plaintiff=%s",
-                    defendant[:40], plaintiff[:40],
-                )
-                continue
+        book    = bm.group(1) if bm else ""
+        page_no = bm.group(2) if bm else ""
+        nhash   = _notice_hash(defendant, book, page_no, rec_date)
 
-            book    = bm.group(1) if bm else ""
-            page_no = bm.group(2) if bm else ""
-            nhash   = _notice_hash(defendant, book, page_no, rec_date)
+        if nhash in seen_ids:
+            logger.info("  Skipping seen: defendant=%s date=%s hash=%s", defendant[:30], rec_date, nhash[:8])
+            continue
 
-            if nhash in seen_ids:
-                logger.debug("  Skipping seen record hash=%s", nhash)
-                continue
-
-            effective_date = rec_date or start
-            if since_date and effective_date and effective_date < since_date:
-                logger.debug(
-                    "  Skipping old record (date=%s < since=%s)", effective_date, since_date
-                )
-                continue
-
-            notice = _parse_lp_row(row_text, search, effective_date or today, seq_base + i + 1)
-            pending.append((nhash, notice, row_text))
-
-        if skipped_non_mortgage:
+        effective_date = rec_date or start
+        if since_date and effective_date and effective_date < since_date:
             logger.info(
-                "  Filtered out %d non-mortgage LP rows (HOA/business grantor)",
-                skipped_non_mortgage,
+                "  Skipping old record: defendant=%s date=%s < since=%s", defendant[:30], effective_date, since_date
             )
+            continue
 
-        # Second pass: LLM for rows missing address
-        if llm_api_key and pending:
-            from llm_parser import extract_with_llm
-            _sem = asyncio.Semaphore(10)
+        notice = _parse_lp_row(row_text, search, effective_date or today, i + 1)
+        pending.append((nhash, notice, row_text))
 
-            async def _llm_one(row_text: str, notice: NoticeData) -> dict:
-                if notice.address:
+    if skipped_non_mortgage:
+        logger.info(
+            "  Filtered out %d non-mortgage LP rows (HOA/business grantor)",
+            skipped_non_mortgage,
+        )
+
+    # Second pass: LLM for rows missing address
+    if llm_api_key and pending:
+        from llm_parser import extract_with_llm
+        _sem = asyncio.Semaphore(10)
+
+        async def _llm_one(row_text: str, notice: NoticeData) -> dict:
+            if notice.address:
+                return {}
+            async with _sem:
+                try:
+                    return await extract_with_llm(
+                        row_text, "lis_pendens", search.county, llm_api_key, state="FL"
+                    )
+                except Exception as exc:
+                    logger.debug("  LLM fallback failed: %s", exc)
                     return {}
-                async with _sem:
-                    try:
-                        return await extract_with_llm(
-                            row_text, "lis_pendens", search.county, llm_api_key, state="FL"
-                        )
-                    except Exception as exc:
-                        logger.debug("  LLM fallback failed: %s", exc)
-                        return {}
 
-            llm_results = await asyncio.gather(
-                *[_llm_one(rt, n) for _, n, rt in pending]
+        llm_results = await asyncio.gather(
+            *[_llm_one(rt, n) for _, n, rt in pending]
+        )
+        for (nhash, notice, _), result in zip(pending, llm_results):
+            if result and not notice.address and result.get("address"):
+                city = result.get("city", "")
+                if not _is_office_address(result["address"], city):
+                    notice.address = result["address"]
+                    notice.city    = city
+                    notice.zip     = result.get("zip", "")
+            seen_ids[nhash] = notice.date_added or today
+            logger.debug(
+                "  Parsed: owner=%s addr=%s",
+                (notice.owner_name or "?")[:35],
+                (notice.address or "NO ADDR — needs PA lookup")[:45],
             )
-            for (nhash, notice, _), result in zip(pending, llm_results):
-                if result and not notice.address and result.get("address"):
-                    city = result.get("city", "")
-                    if not _is_office_address(result["address"], city):
-                        notice.address = result["address"]
-                        notice.city    = city
-                        notice.zip     = result.get("zip", "")
-                seen_ids[nhash] = notice.date_added or today
-                logger.debug(
-                    "  Parsed: owner=%s addr=%s",
-                    (notice.owner_name or "?")[:35],
-                    (notice.address or "NO ADDR — needs PA lookup")[:45],
-                )
-                notices.append(notice)
-        else:
-            for nhash, notice, _ in pending:
-                seen_ids[nhash] = notice.date_added or today
-                notices.append(notice)
-
-        if not await _click_next_page(page):
-            break
+            notices.append(notice)
+    else:
+        for nhash, notice, _ in pending:
+            seen_ids[nhash] = notice.date_added or today
+            notices.append(notice)
 
     logger.info(
         "  DuvalClerk %s/%s: %d records collected",
         search.county, search.notice_type, len(notices),
     )
-    return notices
+    return notices, released_through
 
 
 # ── Main entry point ──────────────────────────────────────────────────
@@ -817,28 +998,30 @@ async def scrape_duval_clerk_all(
     seen_ids: dict[str, str] | None = None,
     llm_api_key: str | None = None,
     proxy_url: str | None = None,
-) -> list[NoticeData]:
-    """Scrape all duval_clerk saved searches and return combined NoticeData.
+    last_released_through: str | None = None,
+) -> tuple[list[NoticeData], str | None]:
+    """Scrape all duval_clerk saved searches and return (notices, released_through).
 
     Args:
-        searches:    SavedSearch entries with source="duval_clerk".
-        since_date:  ISO date string (YYYY-MM-DD); only records on/after this date.
-        seen_ids:    Cross-run dedup dict {record_hash: date}; updated in-place.
-        llm_api_key: Anthropic API key for LLM fallback on missing address fields.
-        proxy_url:   Optional proxy server URL (e.g. Apify residential proxy).
+        searches:               SavedSearch entries with source="duval_clerk".
+        since_date:             ISO date string (YYYY-MM-DD); only records on/after.
+        seen_ids:               Cross-run dedup dict {hash: date}; updated in-place.
+        llm_api_key:            Anthropic API key for LLM address fallback.
+        proxy_url:              Optional proxy URL (unused — see note in code).
+        last_released_through:  Released-through date from the previous run (KVS).
+                                When set and the current released-through has advanced,
+                                a catch-up search is run for the newly-released window.
 
     Returns:
-        List of NoticeData for Duval County lis pendens with state="FL",
-        notice_type="lis_pendens". Property address may be empty for records
-        with no street address in the OR index — enrichment pipeline fills
-        via Duval County Property Appraiser name lookup.
+        (notices, current_released_through) — caller should persist
+        current_released_through to KVS as "last_released_through_date".
     """
     if seen_ids is None:
         seen_ids = {}
 
     dc_only = [s for s in searches if s.source == "duval_clerk"]
     if not dc_only:
-        return []
+        return [], None
 
     logger.info(
         "DuvalClerk: starting %d search(es): %s",
@@ -847,12 +1030,12 @@ async def scrape_duval_clerk_all(
     )
 
     all_notices: list[NoticeData] = []
+    current_released_through: str | None = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                # Prevent sites from detecting headless Chrome via automation flags
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -869,7 +1052,6 @@ async def scrape_duval_clerk_all(
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        # Remove navigator.webdriver flag so Kendo UI doesn't see a bot
         await context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
@@ -878,10 +1060,13 @@ async def scrape_duval_clerk_all(
 
         for search in dc_only:
             try:
-                batch = await _scrape_duval_clerk_search(
-                    page, search, since_date, seen_ids, llm_api_key
+                batch, rt = await _scrape_duval_clerk_search(
+                    page, search, since_date, seen_ids, llm_api_key,
+                    last_released_through=last_released_through,
                 )
                 all_notices.extend(batch)
+                if rt:
+                    current_released_through = rt
             except Exception:
                 logger.exception(
                     "DuvalClerk scrape failed for %s/%s", search.county, search.notice_type
@@ -893,4 +1078,4 @@ async def scrape_duval_clerk_all(
         "DuvalClerk complete: %d total records across %d search(es)",
         len(all_notices), len(dc_only),
     )
-    return all_notices
+    return all_notices, current_released_through

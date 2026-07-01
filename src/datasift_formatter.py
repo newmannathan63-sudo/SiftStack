@@ -220,6 +220,7 @@ NOTICE_TYPE_TO_LIST = {
     "eviction": "FTM",
     "code_violation": "FTM",
     "divorce": "FTM",
+    "lis_pendens": "FTM",
 }
 
 

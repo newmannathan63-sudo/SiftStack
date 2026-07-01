@@ -32,15 +32,38 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
 
     Default timeout is 20s to handle slow SPA rendering in headless/cloud
     environments (Apify containers take longer than local desktop).
+    Uses force=True and JS fallback to bypass chat/popup pointer interception.
     """
+    # Dismiss any support chat popup that might intercept pointer events
+    for chat_selector in [
+        'iframe[id*="intercom"]',
+        '[id*="chat-widget"]',
+        '[class*="intercom"]',
+        '[id*="hubspot"]',
+        'iframe[title*="chat"]',
+    ]:
+        try:
+            el = page.locator(chat_selector)
+            if await el.count() > 0:
+                await page.evaluate(f"document.querySelectorAll('{chat_selector}').forEach(e => e.remove())")
+        except Exception:
+            pass
+
     try:
         btn = page.locator(
             'button:has-text("Next Step"), '
             'button:has-text("Next"), '
             'button:has-text("Continue")'
         )
-        await btn.first.wait_for(state="visible", timeout=timeout)
-        await btn.first.click()
+        # Use "attached" not "visible" — button may be covered by popup overlay
+        await btn.first.wait_for(state="attached", timeout=timeout)
+        try:
+            await btn.first.click(force=True)
+        except Exception:
+            # JS click bypasses all pointer-event interception
+            handle = await btn.first.element_handle()
+            if handle:
+                await page.evaluate("el => el.click()", handle)
         await page.wait_for_timeout(2000)
         return True
     except PwTimeout:
@@ -250,22 +273,36 @@ async def upload_csv(
         logger.debug("Phone numbers dropdown: %s", e)
 
     # "ASSOCIATE DATA WITH LIST" — enter or search for list name
+    # Dismiss Sensei chat popup before interacting with dropdowns (it blocks clicks)
+    await _dismiss_popups(page)
+    await page.wait_for_timeout(300)
+
     try:
         if existing_list:
             # Existing list mode: styled dropdown showing "Select a list"
-            # Click the dropdown to open it, then select the target list
+            # Must use force=True — Sensei popup may still intercept despite dismiss
             list_dropdown = page.locator('text="Select a list"')
             if await list_dropdown.count() > 0:
-                await list_dropdown.first.click()
+                try:
+                    await list_dropdown.first.click(force=True)
+                except Exception:
+                    handle = await list_dropdown.first.element_handle()
+                    if handle:
+                        await page.evaluate("el => el.click()", handle)
                 await page.wait_for_timeout(2000)
                 logger.debug("Opened existing list dropdown")
                 await _screenshot(page, "step1_list_dropdown_opened")
 
-                # Look for the target list name in the dropdown options
+                # Type in search box that appears to filter lists, then click option
+                list_search = page.locator('input[placeholder*="list"], input[placeholder*="Search"]').first
+                if await list_search.count() > 0:
+                    await list_search.fill(list_name or "")
+                    await page.wait_for_timeout(1500)
+
+                # Click the matching option — use last match to avoid label conflicts
                 match = page.locator(f'text="{list_name}"')
                 if await match.count() > 0:
-                    # Click the last match (dropdown option, not the label)
-                    await match.last.click()
+                    await match.last.click(force=True)
                     await page.wait_for_timeout(1000)
                     logger.info("Selected existing list: %s", list_name)
                 else:
@@ -299,6 +336,10 @@ async def upload_csv(
         logger.debug("List name input: %s", e)
 
     await _screenshot(page, "step1_form_filled")
+
+    # Remove any popups (including Sensei chat widget) before clicking Next Step
+    await _dismiss_popups(page)
+    await page.wait_for_timeout(500)
 
     # Click "Next Step" to proceed to step 2
     await _click_next_step(page, timeout=30000)
@@ -434,59 +475,101 @@ async def upload_csv(
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step4_column_mapping")
 
-    # Try to drag unmapped columns (left side) to their targets (right side)
-    # DataSift uses styled-components with draggable="false" — need slow mouse drag
-    async def _drag_column(source_el, target_el):
-        """Drag a CSV column card to a mapping target using slow mouse moves."""
-        src_box = await source_el.bounding_box()
-        dst_box = await target_el.bounding_box()
-        if not src_box or not dst_box:
-            return False
-        sx = src_box["x"] + src_box["width"] / 2
-        sy = src_box["y"] + src_box["height"] / 2
-        dx = dst_box["x"] + dst_box["width"] / 2
-        dy = dst_box["y"] + dst_box["height"] / 2
-        await page.mouse.move(sx, sy)
-        await page.wait_for_timeout(500)
-        await page.mouse.down()
-        await page.wait_for_timeout(500)
-        steps = 20
-        for i in range(1, steps + 1):
-            frac = i / steps
-            await page.mouse.move(
-                sx + (dx - sx) * frac,
-                sy + (dy - sy) * frac,
-            )
-            await page.wait_for_timeout(50)
-        await page.wait_for_timeout(500)
-        await page.mouse.up()
-        await page.wait_for_timeout(1000)
-        return True
+    async def _map_csv_to_datasift(csv_col: str, ds_field: str) -> bool:
+        """Map a CSV column to a DataSift field using right-panel search + slow drag.
 
-    # Map Tags column: find "Tags" card on left, drag to "Tags" target on right
-    for col_name in ["Tags", "Lists"]:
+        Uses the right-panel search to filter the DataSift field list and bring
+        the target slot into view before dragging. JS element finding avoids
+        broad locators that match wrong elements.
+        """
+        right_search = None
         try:
-            # Source: unmapped column card on the left (contains column name + sample data)
-            source = page.locator(f'div:has-text("{col_name}") >> visible=true').first
-            # Target: mapping slot on the right side (search for it)
-            # Right-side targets have the field name — search within right panel area
-            target = page.locator(f'text="{col_name}"').last
-            if await source.count() > 0 and await target.count() > 0:
-                src_box = await source.bounding_box()
-                tgt_box = await target.bounding_box()
-                # Ensure source is on left (<600px) and target is on right (>600px)
-                if src_box and tgt_box and src_box["x"] < 600 and tgt_box["x"] > 600:
-                    if await _drag_column(source, target):
-                        logger.info("Mapped column: %s", col_name)
-                        await page.wait_for_timeout(1000)
-                    else:
-                        logger.warning("Drag failed for column: %s", col_name)
-                else:
-                    logger.debug("Column %s: no valid source/target positions", col_name)
-            else:
-                logger.debug("Column %s: source or target not found", col_name)
+            # Search the RIGHT panel to bring the DataSift field slot into view.
+            # Use exact placeholder "Search..." to avoid matching "Search for records..."
+            # header bar. The column mapping wizard has TWO "Search..." inputs:
+            # [0] = left panel (CSV column search), [1] = right panel (DataSift field search)
+            all_searches = page.locator('input[placeholder="Search..."]')
+            n = await all_searches.count()
+            if n >= 2:
+                right_search = all_searches.nth(1)
+            elif n == 1:
+                right_search = all_searches.first
+            if right_search and await right_search.is_visible():
+                await right_search.click(force=True)
+                await right_search.fill(ds_field)
+                await page.wait_for_timeout(1000)
+
+            # Find LEFT card: the draggable column card whose first child text matches
+            left_pos = await page.evaluate(f"""() => {{
+                for (const el of document.querySelectorAll('*')) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.x > 100 && r.x < 700 && r.y > 150
+                            && r.width > 80 && r.height > 10 && r.height < 150) {{
+                        const kids = [...el.children];
+                        if (kids.length >= 1) {{
+                            const hdr = kids[0].textContent.trim().toUpperCase();
+                            if (hdr === '{csv_col.upper()}') {{
+                                return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};
+                            }}
+                        }}
+                    }}
+                }}
+                return null;
+            }}""")
+
+            # Find RIGHT slot: visible DataSift field slot after search filtering
+            right_pos = await page.evaluate(f"""() => {{
+                for (const el of document.querySelectorAll('*')) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.x > 700 && r.y > 150 && r.width > 100 && r.width < 600
+                            && r.height > 15 && r.height < 250) {{
+                        const text = el.textContent.trim();
+                        if (text === '{ds_field}' || text.startsWith('{ds_field}\\n')
+                                || text.startsWith('{ds_field} ')) {{
+                            return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};
+                        }}
+                    }}
+                }}
+                return null;
+            }}""")
+
+            if not left_pos or not right_pos:
+                logger.debug("Column '%s': left=%s right=%s", csv_col, left_pos, right_pos)
+                return False
+
+            # Slow mouse drag (React DnD requires mouse.down → incremental moves → mouse.up)
+            sx, sy = left_pos["x"], left_pos["y"]
+            dx, dy = right_pos["x"], right_pos["y"]
+            await page.mouse.move(sx, sy)
+            await page.wait_for_timeout(500)
+            await page.mouse.down()
+            await page.wait_for_timeout(500)
+            for i in range(1, 21):
+                frac = i / 20
+                await page.mouse.move(
+                    sx + (dx - sx) * frac,
+                    sy + (dy - sy) * frac,
+                )
+                await page.wait_for_timeout(50)
+            await page.wait_for_timeout(500)
+            await page.mouse.up()
+            await page.wait_for_timeout(1000)
+            logger.info("Mapped CSV '%s' → DataSift '%s'", csv_col, ds_field)
+            return True
+
         except Exception as e:
-            logger.warning("Column mapping %s failed: %s", col_name, e)
+            logger.warning("Column mapping '%s' failed: %s", csv_col, e)
+            return False
+        finally:
+            if right_search:
+                try:
+                    await right_search.fill("")
+                    await page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+    await _map_csv_to_datasift("Tags", "Tags")
+    await _map_csv_to_datasift("Lists", "Lists")
 
     await _screenshot(page, "step4_after_mapping")
 
@@ -514,25 +597,32 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Finish step: %s", e)
 
-    # Wait for processing confirmation
+    # After "Finish Upload", DataSift redirects to the Records page — that IS the success signal.
     try:
-        success_indicator = page.locator(
-            'text="Upload Complete", '
-            'text="successfully", '
-            'text="records imported", '
-            'text="records added", '
-            'text="records uploaded"'
-        )
-        await success_indicator.first.wait_for(timeout=60000)
-        success_text = await success_indicator.first.text_content()
+        await page.wait_for_url("**/records/**", timeout=15000)
         result["success"] = True
-        result["message"] = success_text or "Upload completed"
-        logger.info("DataSift upload complete: %s", result["message"])
+        result["message"] = "Upload submitted — processing in background"
+        logger.info("DataSift upload submitted (redirected to Records page)")
     except PwTimeout:
-        await _screenshot(page, "step5_timeout")
-        result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
-        logger.warning(result["message"])
-        result["success"] = True
+        # May still be on the wizard (e.g. if DataSift shows inline confirmation)
+        try:
+            success_indicator = page.locator(
+                'text="Upload Complete", '
+                'text="successfully", '
+                'text="records imported", '
+                'text="records added", '
+                'text="records uploaded"'
+            )
+            await success_indicator.first.wait_for(timeout=20000)
+            success_text = await success_indicator.first.text_content()
+            result["success"] = True
+            result["message"] = success_text or "Upload completed"
+            logger.info("DataSift upload complete: %s", result["message"])
+        except PwTimeout:
+            await _screenshot(page, "step5_timeout")
+            result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
+            logger.warning(result["message"])
+            result["success"] = True
 
     await _save_cookies(page)
     return result
@@ -1038,6 +1128,7 @@ async def upload_to_datasift(
     headless: bool = True,
     enrich: bool = True,
     skip_trace: bool = True,
+    list_name: str = "FTM",
 ) -> dict:
     """Full DataSift workflow: launch browser → login → upload CSV → enrich → skip trace.
 
@@ -1048,6 +1139,7 @@ async def upload_to_datasift(
         headless: Run browser in headless mode.
         enrich: Run "Enrich Property Information" after upload (default True).
         skip_trace: Run "Skip Trace" after upload (default True, uses unlimited plan).
+        list_name: DataSift list to upload into (default "FTM").
 
     Returns:
         Dict with upload results including enrich_result and skip_trace_result.
@@ -1086,14 +1178,14 @@ async def upload_to_datasift(
                     "message": "DataSift login failed",
                 }
 
-            # Upload CSV
-            result = await upload_csv(page, csv_path)
+            # Upload CSV into the FTM list (or whichever list_name specifies)
+            result = await upload_csv(
+                page, csv_path,
+                list_name=list_name,
+                existing_list=True,
+            )
 
             if result.get("success"):
-                # Derive list name (same format as upload_csv generates)
-                from datetime import datetime as _dt
-                list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
-
                 # Enrich property data via SiftMap
                 if enrich:
                     enrich_result = await enrich_records(page, list_name)

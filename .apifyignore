@@ -38,3 +38,7 @@ dropbox_state.json
 photo_state.json
 *.tmp
 *.bak
+*.bak2
+run_deal_*.py
+photos*/
+seen_ids*

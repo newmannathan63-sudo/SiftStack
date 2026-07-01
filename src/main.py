@@ -320,6 +320,11 @@ async def actor_main() -> None:
             seen_ids = await kvs.get_value("seen_notice_ids") or {}
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
 
+            # ── Load last released-through date (Duval Clerk catch-up logic) ──
+            last_released_through = await kvs.get_value("last_released_through_date") or None
+            if last_released_through:
+                Actor.log.info("Loaded last_released_through_date = %s from KVS", last_released_through)
+
             async def persist_seen_ids(ids: dict) -> None:
                 """Mid-run persistence — if a later search crashes, progress is kept."""
                 try:
@@ -328,6 +333,8 @@ async def actor_main() -> None:
                         "last_run_date",
                         datetime.now().strftime("%Y-%m-%d"),
                     )
+                    if last_released_through:
+                        await kvs.set_value("last_released_through_date", last_released_through)
                 except Exception as e:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
@@ -362,13 +369,16 @@ async def actor_main() -> None:
 
             if duval_clerk_searches_actor:
                 from duval_clerk_scraper import scrape_duval_clerk_all
-                dc_notices = await scrape_duval_clerk_all(
+                dc_notices, dc_released_through = await scrape_duval_clerk_all(
                     searches=duval_clerk_searches_actor,
                     since_date=since_date_override or None,
                     seen_ids=seen_ids,
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
                     proxy_url=proxy_url,
+                    last_released_through=last_released_through,
                 )
+                if dc_released_through:
+                    last_released_through = dc_released_through
                 await persist_seen_ids(seen_ids)
                 notices.extend(dc_notices)
 
@@ -588,12 +598,14 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
-            # ── Save last_run_date + seen_notice_ids to Apify KVS for next run ─────
+            # ── Save state to Apify KVS for next run ─────────────────────────────
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
             await kvs.set_value("seen_notice_ids", seen_ids)
+            if last_released_through:
+                await kvs.set_value("last_released_through_date", last_released_through)
             Actor.log.info(
-                "Saved last_run_date + %d seen_notice_ids to KVS for next daily run",
-                len(seen_ids),
+                "Saved last_run_date=%s, released_through=%s, %d seen_notice_ids to KVS",
+                datetime.now().strftime("%Y-%m-%d"), last_released_through, len(seen_ids),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
@@ -1829,7 +1841,7 @@ def _run_scrape_pipeline(args, searches) -> None:
     if duval_clerk_searches:
         from duval_clerk_scraper import scrape_duval_clerk_all
         seen_ids = load_state(SEEN_IDS_FILE)
-        dc_notices = asyncio.run(scrape_duval_clerk_all(
+        dc_notices, _ = asyncio.run(scrape_duval_clerk_all(
             searches=duval_clerk_searches,
             since_date=effective_since,
             seen_ids=seen_ids,

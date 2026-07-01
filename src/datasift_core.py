@@ -152,35 +152,95 @@ async def login(page, email: str = None, password: str = None) -> bool:
             return True
         logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
 
+    # Clear any stale cookies before fresh login — expired session cookies in
+    # the context can interfere with React checkbox state on the login page.
+    await page.context.clear_cookies()
+
     # Fresh login
     await page.goto(DATASIFT_LOGIN_URL, wait_until="domcontentloaded")
 
-    # Fill credentials
-    await page.get_by_role("textbox", name="Email").fill(email)
-    await page.get_by_role("textbox", name="Password").fill(password)
+    # Wait for the email field to be visible before interacting — React needs
+    # a moment to hydrate even after domcontentloaded.
+    email_field = page.get_by_role("textbox", name="Email")
+    await email_field.wait_for(state="visible", timeout=10000)
 
-    # Hidden checkboxes — click labels, not inputs
+    # Click to focus then fill — ensures React controlled-input state updates.
+    await email_field.click()
+    await email_field.fill(email)
+
+    password_field = page.get_by_role("textbox", name="Password")
+    await password_field.click()
+    await password_field.fill(password)
+
+    # Hidden checkboxes — click labels, not inputs (inputs are visually hidden).
+    # "Remember me" is the first checkbox; Terms is the second.
     remember_label = page.locator('label:has-text("Remember me")')
     if await remember_label.count() > 0:
         await remember_label.first.click()
 
-    terms_label = page.locator('label:has-text("I\'ve read and agree")')
-    if await terms_label.count() > 0:
-        await terms_label.first.click()
+    # Terms checkbox: try JS click on the underlying input first (most reliable),
+    # fall back to label click. Required for the server to create a valid session.
+    terms_checked = False
+    try:
+        terms_inputs = page.locator('input[type="checkbox"]')
+        count = await terms_inputs.count()
+        # Terms is the last checkbox on the page (Remember me is first)
+        if count >= 2:
+            terms_input = terms_inputs.nth(count - 1)
+            if not await terms_input.is_checked():
+                await page.evaluate("el => el.click()", await terms_input.element_handle())
+            terms_checked = await terms_input.is_checked()
+    except Exception as e:
+        logger.debug("JS checkbox click failed (%s), trying label click", e)
+
+    if not terms_checked:
+        terms_label = page.locator('label:has-text("I\'ve read and agree")')
+        if await terms_label.count() > 0:
+            await terms_label.first.click()
+
+    await screenshot(page, "login_before_submit")
 
     # Click Sign In
     await page.get_by_role("button", name="Sign In").click()
 
-    # Wait for navigation away from login page
+    # Wait for navigation away from the login page. DataSift may redirect to
+    # /dashboard/general, /records/properties, or /?next=... depending on the
+    # entry path — watch for URL to leave /login rather than a specific destination.
     try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
+        await page.wait_for_function(
+            "() => !window.location.pathname.startsWith('/login')",
+            timeout=20000,
+        )
     except PwTimeout:
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
-            return False
+        await screenshot(page, "login_failed")
+        logger.error("DataSift login failed — still on login page (url=%s)", page.url)
+        return False
+
+    # Capture what the server returned immediately after Sign In
+    await page.wait_for_timeout(2000)
+    await screenshot(page, "login_post_submit")
+    logger.info("Post-Sign In URL: %s", page.url)
+    logger.info("Post-Sign In page text snippet: %s", (await page.inner_text("body"))[:300])
+
+    # Verify the session is actually valid by navigating to a protected page and
+    # confirming we actually ARRIVE there. DataSift's unauthenticated redirect
+    # lands at /?next=%2Frecords%2Fproperties (no /login literal) so we can't
+    # just check for absence of "/login" — we must confirm "/records" is reached.
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_url("**/records/**", timeout=12000)
+    except PwTimeout:
+        pass
+
+    if "/records" not in page.url:
+        await screenshot(page, "login_session_invalid")
+        logger.error(
+            "DataSift login: session not valid — records page redirected to %s", page.url
+        )
+        return False
 
     await save_cookies(page)
-    logger.info("DataSift login successful")
+    logger.info("DataSift login successful (url=%s)", page.url)
     return True
 
 
@@ -221,12 +281,35 @@ async def dismiss_popups(page) -> None:
             document.querySelectorAll('[class*="nps-iframe"], [class*="beamer"]').forEach(
                 el => { el.remove(); removed++; }
             );
+            // Remove Beamer push modal
+            const bpm = document.getElementById('beamerPushModal');
+            if (bpm) { bpm.remove(); removed++; }
             // Remove aside overlay (filter panel backdrop that blocks pointer events)
             const aside = document.getElementById('asideOverlay');
             if (aside) { aside.remove(); removed++; }
             document.querySelectorAll('[class*="AsideOverlay"]').forEach(
                 el => { el.remove(); removed++; }
             );
+            // Remove DataSift "Sensei" support chat conversation card
+            // This widget floats at bottom-right and overlaps the "Next Step" button
+            document.querySelectorAll('*').forEach(el => {
+                const txt = el.textContent || '';
+                const rect = el.getBoundingClientRect();
+                if ((txt.includes('Rate your conversation') || txt.includes('Sensei'))
+                        && rect.bottom > window.innerHeight * 0.7
+                        && rect.right > window.innerWidth * 0.6
+                        && rect.width < 500 && rect.height < 200
+                        && rect.width > 50) {
+                    el.remove();
+                    removed++;
+                }
+            });
+            // Remove any support chat iframes
+            document.querySelectorAll(
+                'iframe[id*="chat"], iframe[class*="chat"], '
+                + '[id*="chaskiq"], [class*="chaskiq"], '
+                + '[id*="crisp"], [class*="crisp-client"]'
+            ).forEach(el => { el.remove(); removed++; });
             // Look for the notification popup overlay
             const els = document.querySelectorAll(
                 '[class*="notification"], [class*="Notification"], '
