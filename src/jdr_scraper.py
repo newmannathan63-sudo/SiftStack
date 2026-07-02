@@ -720,10 +720,16 @@ def _split_notice_text(full_text: str) -> list[tuple[str, str]]:
     )
     parts = split_re.split(full_text)
     results: list[tuple[str, str]] = []
-    for part in parts:
+    for i, part in enumerate(parts):
         part = part.strip()
-        if len(part) > 100:
-            results.append((_parse_pub_date_from_block(part), part))
+        if len(part) <= 100:
+            continue
+        # parts[0] is whatever precedes the first real match (site nav/boilerplate
+        # when the page has no notices at all, e.g. a "Next" link past the last
+        # real page) — only keep it if it actually starts with a notice header.
+        if i == 0 and not split_re.match(part):
+            continue
+        results.append((_parse_pub_date_from_block(part), part))
     return results
 
 
