@@ -887,7 +887,11 @@ def write_datasift_split_csvs(
     results.append({
         "path": dm_path,
         "label": "DMs",
-        "list_name": f"SiftStack {date_str} - DMs",
+        # "FTM" is the persistent DataSift list the upload wizard's
+        # existing_list=True mode searches for (see a6ed5bf). A fresh
+        # date-stamped name here would never match an existing list, so the
+        # wizard's list-association step silently fails every run.
+        "list_name": "FTM",
     })
 
     # CSV 2: Heirs — only deceased with heir data
@@ -911,7 +915,7 @@ def write_datasift_split_csvs(
         results.append({
             "path": heir_path,
             "label": "Heirs",
-            "list_name": f"SiftStack {date_str} - Heirs",
+            "list_name": "FTM",
         })
     else:
         logger.info("No deceased records with heir data — skipping Heirs CSV")
