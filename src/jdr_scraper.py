@@ -649,6 +649,37 @@ _JDR_SERIAL_RE = re.compile(
 )
 
 
+async def _wait_for_stable_row_count(result_tbl, max_wait_s: float = 6.0) -> None:
+    """Poll a results table's row count until it stops growing.
+
+    `networkidle` can resolve before JDR's results table has finished
+    populating all rows (e.g. progressive/AJAX rendering) — extracting
+    immediately after can silently capture only a partial page (seen live:
+    22 of 53 real rows on 2026-07-02), with no error or warning to flag it.
+    Requires two consecutive identical counts (~400ms apart) before treating
+    the table as settled.
+    """
+    prev_count = -1
+    stable_checks = 0
+    elapsed = 0.0
+    interval = 0.4
+    while elapsed < max_wait_s:
+        try:
+            rows = await result_tbl.query_selector_all("tr")
+        except Exception:
+            return
+        count = len(rows)
+        if count == prev_count:
+            stable_checks += 1
+            if stable_checks >= 2:
+                return
+        else:
+            stable_checks = 0
+        prev_count = count
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+
 async def _extract_notice_blocks(page: Page) -> list[tuple[str, str]]:
     """Extract (pub_date, text) tuples from the current results page.
 
@@ -669,6 +700,7 @@ async def _extract_notice_blocks(page: Page) -> list[tuple[str, str]]:
             result_tbl = all_tables[-1]   # last table = results (form is first)
 
     if result_tbl:
+        await _wait_for_stable_row_count(result_tbl)
         rows = await result_tbl.query_selector_all("tr")
         logger.debug("JDR results table: %d rows (skipping row 0 = category header)", len(rows))
         results: list[tuple[str, str]] = []
