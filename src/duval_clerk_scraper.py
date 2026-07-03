@@ -873,7 +873,11 @@ async def _scrape_duval_clerk_search(
             datetime.strptime(last_released_through, "%Y-%m-%d") + timedelta(days=1)
         ).strftime("%Y-%m-%d")
         catch_end = released_through
-        if catch_start < start:
+        # Both ends of the catch-up window must precede the main range's start —
+        # if catch_end reaches into [start, today], the main search (which already
+        # includes unreleased records via the HTML table) has covered that overlap
+        # already, and re-fetching it here would duplicate those rows.
+        if catch_start < start and catch_end < start:
             logger.info(
                 "  DuvalClerk: catch-up search for newly-released records %s → %s",
                 catch_start, catch_end,
@@ -903,6 +907,12 @@ async def _scrape_duval_clerk_search(
     # First pass: filter + parse all rows
     pending: list[tuple[str, NoticeData, str]] = []
     skipped_non_mortgage = 0
+    # Tracks hashes already queued in `pending` during this loop. `seen_ids`
+    # only gets its entries added *after* this whole pass finishes (below), so
+    # two identical rows within the same `all_rows` batch (e.g. from an
+    # overlapping catch-up search or a pagination re-fetch) would otherwise
+    # both pass the `nhash in seen_ids` check and both end up in the output.
+    batch_seen: set[str] = set()
     for i, (rec_date, row_text) in enumerate(all_rows):
         gm = LP_GRANTOR_RE.search(row_text)
         bm = LP_BOOK_PAGE_RE.search(row_text)
@@ -923,9 +933,10 @@ async def _scrape_duval_clerk_search(
         page_no = bm.group(2) if bm else ""
         nhash   = _notice_hash(defendant, book, page_no, rec_date)
 
-        if nhash in seen_ids:
+        if nhash in seen_ids or nhash in batch_seen:
             logger.info("  Skipping seen: defendant=%s date=%s hash=%s", defendant[:30], rec_date, nhash[:8])
             continue
+        batch_seen.add(nhash)
 
         effective_date = rec_date or start
         if since_date and effective_date and effective_date < since_date:

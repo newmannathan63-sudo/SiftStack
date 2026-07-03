@@ -140,6 +140,22 @@ def _notice_id_from_url(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def _book_page_from_url(url: str) -> str:
+    """Extract a stable "book/page" recording key from a Duval Clerk source URL.
+
+    Lis pendens URLs look like: .../SearchTypeDocType?...&bk=1234&pg=5678
+    bk/pg identify the actual recorded document, unlike the `seq` param (just
+    this run's row position) or `address` (usually blank until enrichment
+    fills it in later, well after dedup has already run).
+    """
+    import re
+    bk = re.search(r"[?&]bk=([^&]+)", url)
+    pg = re.search(r"[?&]pg=([^&]+)", url)
+    if bk and pg:
+        return f"{bk.group(1)}/{pg.group(1)}"
+    return ""
+
+
 def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
     """Remove duplicate notices by notice ID (from source URL).
 
@@ -147,10 +163,12 @@ def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
     notice may match both "foreclosure" and "tax_sale" keyword searches).
     We keep the first occurrence of each notice ID.
 
-    Falls back to address-based dedup if no notice ID is available.
+    Falls back to book/page (Duval Clerk recordings) or address-based dedup
+    if no notice ID is available.
     """
     seen_ids: set[str] = set()
     seen_parcels: set[str] = set()
+    seen_book_pages: set[str] = set()
     seen_addrs: dict[str, NoticeData] = {}
     result: list[NoticeData] = []
 
@@ -173,7 +191,18 @@ def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
             result.append(notice)
             continue
 
-        # Tertiary: by address (for notices without ID or parcel)
+        # Secondary-b: by recording book/page (Duval Clerk lis pendens — these
+        # arrive without an address, so the tertiary address key below is
+        # empty and would let true duplicates through unfiltered).
+        bkpg = _book_page_from_url(notice.source_url)
+        if bkpg:
+            if bkpg in seen_book_pages:
+                continue
+            seen_book_pages.add(bkpg)
+            result.append(notice)
+            continue
+
+        # Tertiary: by address (for notices without ID, parcel, or book/page)
         key = notice.address.strip().lower()
         if not key:
             result.append(notice)
