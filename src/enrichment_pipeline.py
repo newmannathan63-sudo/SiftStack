@@ -11,6 +11,7 @@ run_enrichment_pipeline(). The pipeline handles dedup, filtering,
 and all enrichment steps in a fixed canonical order.
 """
 
+import asyncio
 import logging
 import re
 import uuid
@@ -416,9 +417,37 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  Probate property lookup failed: %s", e)
 
+    # ── Step 3d0: Lis Pendens Address Lookup (Duval Clerk CORE case search) ──
+    # Ground-truth check via the actual court case's Parties table — more
+    # reliable than a county-wide name search (Step 3d below) since it's
+    # scoped to the handful of parties on that specific lawsuit. Runs
+    # regardless of whether an address is already set, since the OR-index/
+    # OCR address can be outright wrong (mismatched name, misread OCR), not
+    # just missing. Only covers records where a case_number was extracted
+    # from the recorded LP document's OCR text.
+    lp_with_case_no = [
+        n for n in notices
+        if n.notice_type == "lis_pendens"
+        and n.county.lower() == "duval"
+        and n.case_number.strip()
+        and n.owner_name.strip()
+    ]
+    if lp_with_case_no:
+        logger.info("── Step 3d0: Lis Pendens CORE Case Lookup (%d candidates) ──", len(lp_with_case_no))
+        try:
+            from duval_core_scraper import lookup_case_addresses
+            matched = asyncio.run(lookup_case_addresses(lp_with_case_no))
+            logger.info("  Address matched via CORE: %d/%d", matched, len(lp_with_case_no))
+        except ImportError:
+            logger.warning("  duval_core_scraper not available — skipping")
+        except Exception as e:
+            logger.warning("  CORE case lookup failed: %s", e)
+
     # ── Step 3d: Lis Pendens Address Lookup (Duval County DCPA) ─────
     # Duval Clerk OR index has no street address — look up by grantor name
-    # via the Duval County Property Appraiser public search.
+    # via the Duval County Property Appraiser public search. Fallback for
+    # records Step 3d0 couldn't resolve (no case_number, login failure, or
+    # no confident defendant match).
     lp_no_addr = [
         n for n in notices
         if n.notice_type == "lis_pendens"

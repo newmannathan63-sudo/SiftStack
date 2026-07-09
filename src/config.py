@@ -49,6 +49,7 @@ TRESTLE_API_KEY = os.getenv("TRESTLE_API_KEY", "")            # Trestle phone va
 DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai login
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")                    # Apify API token (for syncing cloud run output)
 ANCESTRY_EMAIL = os.getenv("ANCESTRY_EMAIL", "")              # Ancestry.com login
 ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key
@@ -76,6 +77,12 @@ JDR_SEARCH_URL = f"{JDR_BASE_URL}/legal_notices.php"
 
 # Duval County Clerk Official Records — lis pendens / preforeclosure (public, no login)
 DUVAL_CLERK_URL = os.getenv("DUVAL_CLERK_URL", "https://or.duvalclerk.com/")
+
+# Duval Clerk of Circuit Court CORE ePortal — case search by case number,
+# used to look up the correct defendant/property address (requires login)
+DUVAL_CORE_URL = "https://core.duvalclerk.com/CoreCms.aspx"
+DUVAL_CORE_EMAIL = os.getenv("DUVAL_CORE_EMAIL", "")
+DUVAL_CORE_PASSWORD = os.getenv("DUVAL_CORE_PASSWORD", "")
 
 # ── ASP.NET Selectors ─────────────────────────────────────────────────
 # Login form
@@ -143,7 +150,13 @@ BUSINESS_RE = re.compile(
     r"\b(?:LLC|L\.L\.C|INC|CORP|CORPORATION|COMPANY|CO\b|LTD|LP|L\.P|"
     r"PARTNERSHIP|ASSOCIATION|ASSOC|BANK|CREDIT UNION|CHURCH|MINISTRIES|"
     r"HOUSING|AUTHORITY|DEVELOPMENT|ENTERPRISES|PROPERTIES|INVESTMENTS|"
-    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION)\b",
+    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION|"
+    # Government entities — not real distressed-homeowner leads even when
+    # named as a case defendant (e.g. a municipal lien/easement codefendant).
+    # Verified 2026-07-08: "Jacksonville City Of" slipped through as a lis
+    # pendens "owner" and CORE correctly resolved it to City Hall's address.
+    r"CITY\s+OF|COUNTY\s+OF|STATE\s+OF\s+FLORIDA|SCHOOL\s+BOARD|"
+    r"SCHOOL\s+DISTRICT)\b",
     re.IGNORECASE,
 )
 

@@ -71,10 +71,19 @@ LP_GRANTOR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Case number from the notice text (FL format: 16-2026-CA-001234)
+# Case number from the notice text (FL UCN format: 16-2026-CA-004689-AXXX-MA —
+# county-2-digit prefix, year, case type, sequence, then division/subtype
+# suffixes that can repeat, e.g. "-AXXX-MA"). The Clerk's recording stamp puts
+# the UCN on its own line near the top with NO "Case No." label at all — the
+# actual "Case No." line later in the document body is usually a blank
+# template field — so the label prefix must be optional, not required.
+# The leading "16-" (county prefix) hyphen is a common OCR dropout at the
+# very start of the stamped line (e.g. "162026-CA-004751-AXXX-MA") — captured
+# as a separate group so the caller can always reassemble a normalized UCN
+# regardless of whether OCR preserved that hyphen.
 LP_CASE_NO_RE = re.compile(
-    r"Case\s+(?:No\.?|Number|#)?\s*[:\s]*"
-    r"([0-9]{2}-[0-9]{4}-CA-[0-9]+(?:-[A-Z0-9]+)?)",
+    r"(?:Case\s+(?:No\.?|Number|#)?\s*[:\s]*)?"
+    r"\b([0-9]{2})-?([0-9]{4}-CA-[0-9]+(?:-[A-Z0-9]+)*)\b",
     re.IGNORECASE,
 )
 
@@ -111,6 +120,15 @@ _NON_MORTGAGE_PLAINTIFF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Generic "<Development Name> Association, Inc." catch-all — FL HOAs/condo
+# associations are almost universally incorporated this way (e.g. "Sandpiper
+# Association, Inc."), but the name itself is the development's name, not a
+# recognizable HOA keyword, so the enumerated regex above misses it. Real
+# mortgage lenders are never registered simply as "___ Association, Inc."
+_GENERIC_ASSOCIATION_INC_RE = re.compile(
+    r"\bASSOCIATION,?\s+INC\b", re.IGNORECASE,
+)
+
 
 def _is_mortgage_preforeclosure(plaintiff: str, defendant: str) -> bool:
     """Return True only if this LP row looks like a mortgage preforeclosure.
@@ -128,7 +146,171 @@ def _is_mortgage_preforeclosure(plaintiff: str, defendant: str) -> bool:
         return False
     if _NON_MORTGAGE_PLAINTIFF_RE.search(plaintiff):
         return False
+    if _GENERIC_ASSOCIATION_INC_RE.search(plaintiff):
+        return False
     return True
+
+
+# ── Ground-truth document fetch + OCR ────────────────────────────────
+#
+# The OR index row never contains a property address (verified live). The
+# actual recorded lis pendens document does — but it's a scanned image PDF
+# behind an opaque `docId` token that only exists once you click the row in
+# the live grid (it is NOT derivable from instrument #/book/page). So this
+# must run while the row's DOM element is still valid, during the same grid
+# page as `_extract_index_rows` — not as a later enrichment-tier fallback.
+
+_LP_DOC_PARCEL_RE = re.compile(
+    r"Parcel\s+(?:Identification\s+Number|ID)\s*:?\s*([\d]{3,}-?[\d]{2,})", re.IGNORECASE
+)
+# Real Duval lis pendens filings label the property line "COMMONLY KNOWN AS:",
+# not "Property Address:" — verified against live OCR output (2026-07-08).
+# Keep both since a "Property Address:" phrasing may appear in other filers'
+# templates.
+_LP_DOC_ADDRESS_RE = re.compile(
+    r"(?:Property\s+Address|Commonly\s+Known\s+As|a/?k/?a)\s*:?\s*(.+?)(?:\n|$)", re.IGNORECASE
+)
+# Nature-of-action language that marks an HOA/condo LIEN case, not a mortgage
+# preforeclosure — a defense-in-depth check for plaintiff names the pre-filter
+# regexes above don't catch (e.g. a development named "Foo Association, Inc."
+# with unusual formatting, or a differently-worded HOA plaintiff).
+#
+# Deliberately does NOT include a bare "HOMEOWNERS ASSOCIATION" / "CONDOMINIUM
+# ASSOCIATION" phrase — FL mortgage foreclosures routinely join the property's
+# HOA/condo association as a co-DEFENDANT (to subordinate its lien in the
+# sale), so that phrase alone appears in plenty of legitimate mortgage cases
+# and produced false positives (e.g. "PEREGRINE MEADOWS HOMEOWNERS
+# ASSOCIATION, INC." as a defendant, verified 2026-07-08). Only match language
+# that specifically describes the ASSOCIATION bringing its own lien claim.
+_LP_DOC_HOA_RE = re.compile(
+    r"CLAIM\s+OF\s+LIEN|OWNER.?S\s+ASSESSMENTS|ASSESSMENTS?\s+AND\s+COLLECTION\s+COSTS",
+    re.IGNORECASE,
+)
+
+
+def _parse_lp_document_text(ocr_text: str) -> dict:
+    """Extract property address / parcel ID / case number / HOA-lien signal
+    from OCR'd LP document text.
+
+    Returns a dict with any of: address, city, zip, parcel_id, case_number,
+    hoa_lien. Missing/unparseable fields are simply omitted — caller merges
+    what it can.
+    """
+    result: dict = {}
+
+    cm = LP_CASE_NO_RE.search(ocr_text)
+    if cm:
+        result["case_number"] = f"{cm.group(1)}-{cm.group(2)}".strip().upper()
+
+    pm = _LP_DOC_PARCEL_RE.search(ocr_text)
+    if pm:
+        result["parcel_id"] = pm.group(1).strip()
+
+    am = _LP_DOC_ADDRESS_RE.search(ocr_text)
+    if am:
+        addr_line = re.sub(r"\s+", " ", am.group(1)).strip().rstrip(".")
+        # Common OCR confusion: "1st" often reads as "Ist"/"lst".
+        addr_line = re.sub(r"\b[Il]st\b", "1st", addr_line)
+        m2 = re.match(
+            r"(.+?),\s*([\w\s]+?),\s*(?:FL|Florida)\.?\s*(\d{5}(?:-\d{4})?)?",
+            addr_line, re.IGNORECASE,
+        )
+        if m2:
+            result["address"] = m2.group(1).strip()
+            result["city"] = m2.group(2).strip()
+            if m2.group(3):
+                result["zip"] = m2.group(3)
+        elif addr_line:
+            result["address"] = addr_line
+
+    if _LP_DOC_HOA_RE.search(ocr_text):
+        result["hoa_lien"] = True
+
+    return result
+
+
+async def _fetch_lp_details(page: Page, instrument_cell) -> dict:
+    """Click an OR index row's instrument-number cell to open its Details tab.
+
+    Returns {"pdf_bytes": bytes|None, "case_number": str}. The case number is
+    read directly from the Details page's own structured metadata panel
+    (a "CaseNumber:" label/value pair, verified 2026-07-08) — that field is
+    populated even when the document image itself shows "Image Not
+    Available", so it's available strictly more often than OCR and doesn't
+    depend on image quality at all.
+    """
+    result: dict = {"pdf_bytes": None, "case_number": ""}
+    new_page = None
+    try:
+        async with page.context.expect_page(timeout=8_000) as new_page_info:
+            await instrument_cell.click()
+        new_page = await new_page_info.value
+        await new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        await new_page.wait_for_timeout(2_000)
+
+        case_no_cell = new_page.locator(
+            "div.docDetailRow:has(div.detailLabel:text-is('CaseNumber:')) div.listDocDetails"
+        )
+        if await case_no_cell.count() > 0:
+            case_text = (await case_no_cell.first.inner_text()).strip().splitlines()[0].strip()
+            if case_text:
+                result["case_number"] = case_text.upper()
+
+        iframe = new_page.locator("iframe").first
+        if await iframe.count() == 0:
+            return result
+        iframe_src = await iframe.get_attribute("src")
+        if not iframe_src or "DocumentImage1" not in iframe_src:
+            return result
+        pdf_url = iframe_src.replace("DocumentImage1", "DocumentPdfAllPages")
+
+        resp = await new_page.request.get(pdf_url)
+        if resp.status == 200:
+            result["pdf_bytes"] = await resp.body()
+        return result
+    except Exception as e:
+        logger.debug("  LP details fetch failed: %s", e)
+        return result
+    finally:
+        if new_page is not None:
+            try:
+                await new_page.close()
+            except Exception:
+                pass
+
+
+async def _fetch_and_ocr_lp_document(page: Page, instrument_cell) -> dict:
+    """Fetch the actual recorded LP document's details + image, and OCR the
+    image for ground-truth property address / parcel ID. Returns whatever it
+    could get — at minimum the Details-page case_number even if the image
+    is unavailable or OCR fails entirely; callers fall back to the existing
+    DCPA name-lookup tier for anything still missing.
+    """
+    details = await _fetch_lp_details(page, instrument_cell)
+    base: dict = {}
+    if details["case_number"]:
+        base["case_number"] = details["case_number"]
+
+    pdf_bytes = details["pdf_bytes"]
+    if not pdf_bytes:
+        return base
+    try:
+        from image_utils import fix_rotation, ocr_page, render_pdf_bytes
+        images = render_pdf_bytes(pdf_bytes, dpi=300)
+        if not images:
+            return base
+        img = fix_rotation(images[0])
+        ocr_text = ocr_page(img, psm=3)
+        parsed = _parse_lp_document_text(ocr_text)
+        # The Details-page case number is structured data, not an OCR guess —
+        # prefer it over whatever (possibly OCR-garbled) case number the text
+        # scan found.
+        if base.get("case_number"):
+            parsed["case_number"] = base["case_number"]
+        return parsed
+    except Exception as e:
+        logger.debug("  LP document OCR failed: %s", e)
+        return base
 
 
 # Reuse jdr_scraper patterns; import added above.
@@ -533,8 +715,8 @@ async def _try_export_csv(page: Page) -> list[tuple[str, str]] | None:
         return None
 
 
-async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
-    """Extract (recorded_date, row_text) tuples from the OR results page.
+async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
+    """Extract (recorded_date, row_text, doc_fields) tuples from the OR results page.
 
     Uses HTML table scraping as primary. The CSV export is limited to records
     at or below the "Released through Instrument Number" shown in the site banner,
@@ -548,6 +730,12 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
       R# | First Direct Name | First Indirect Name | Instrument # |
       Record Date | Doc Type | Book Type | Book/Page | Doc Link |
       Consideration | Legal | DeletedAfter
+
+    For each row that looks like a real mortgage preforeclosure, also clicks
+    through to the actual recorded document and OCRs it for ground-truth
+    property address / parcel ID / HOA-lien signal (doc_fields — see
+    `_fetch_and_ocr_lp_document`). Only possible from this HTML-table path:
+    the CSV export has no interactive rows to click, so those get {}.
     """
     # Primary: scrape the Kendo grid HTML table (includes unreleased records)
     # The Kendo grid renders as a <table> inside a div.k-grid-content
@@ -568,10 +756,11 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
     if not result_tbl:
         logger.info("DuvalClerk: HTML table not found — falling back to CSV export")
         csv_rows = await _try_export_csv(page)
-        return csv_rows or []
+        return [(d, t, {}) for d, t in (csv_rows or [])]
 
     rows = await result_tbl.query_selector_all("tr")
-    results: list[tuple[str, str]] = []
+    results: list[tuple[str, str, dict]] = []
+    doc_fetch_count = 0
     for row in rows[1:]:  # row 0 is the header
         try:
             cells = await row.query_selector_all("td")
@@ -621,11 +810,24 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str]]:
             )
             if doc_link:
                 row_text += f"\nDoc Link: {doc_link}"
-            results.append((rec_date, row_text))
+
+            # Ground-truth document fetch — only for rows that already look
+            # like a real mortgage preforeclosure (cheap pre-filter avoids
+            # wasting a click+download+OCR round-trip on obvious HOA/contractor
+            # lien rows, which get dropped later in the caller anyway).
+            doc_fields: dict = {}
+            if _is_mortgage_preforeclosure(plaintiff, defendant) and len(cells) > 3 + _offset:
+                doc_fields = await _fetch_and_ocr_lp_document(page, cells[3 + _offset])
+                if doc_fields:
+                    doc_fetch_count += 1
+
+            results.append((rec_date, row_text, doc_fields))
         except Exception:
             continue
 
     logger.info("DuvalClerk: extracted %d rows from HTML table (includes unreleased records)", len(results))
+    if doc_fetch_count:
+        logger.info("DuvalClerk: fetched+OCR'd %d/%d recorded documents for ground-truth address/parcel", doc_fetch_count, len(results))
     return results
 
 
@@ -801,8 +1003,8 @@ async def _resubmit_search_dates(page: Page, start: str, end: str) -> bool:
 
 async def _collect_rows_from_search(
     page: Page, start: str, end: str, navigate: bool = True
-) -> list[tuple[str, str]]:
-    """Submit a search for [start, end] and return all (rec_date, row_text) pairs.
+) -> list[tuple[str, str, dict]]:
+    """Submit a search for [start, end] and return all (rec_date, row_text, doc_fields) tuples.
 
     navigate=True (default): calls _submit_search_form which does page.goto first.
     navigate=False: stays on the current results page and just updates date inputs.
@@ -813,7 +1015,7 @@ async def _collect_rows_from_search(
         ok = await _resubmit_search_dates(page, start, end)
     if not ok:
         return []
-    all_rows: list[tuple[str, str]] = []
+    all_rows: list[tuple[str, str, dict]] = []
     page_num = 0
     while True:
         page_num += 1
@@ -855,7 +1057,7 @@ async def _scrape_duval_clerk_search(
     start = since_date or (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
     # ── Main range search (released records in [start, today]) ───────
-    all_rows: list[tuple[str, str]] = await _collect_rows_from_search(page, start, today)
+    all_rows: list[tuple[str, str, dict]] = await _collect_rows_from_search(page, start, today)
 
     # Parse the released-through date so we can persist it and detect changes.
     released_through = await _parse_released_through_date(page)
@@ -907,13 +1109,15 @@ async def _scrape_duval_clerk_search(
     # First pass: filter + parse all rows
     pending: list[tuple[str, NoticeData, str]] = []
     skipped_non_mortgage = 0
+    skipped_hoa_doc = 0
+    doc_matched = 0
     # Tracks hashes already queued in `pending` during this loop. `seen_ids`
     # only gets its entries added *after* this whole pass finishes (below), so
     # two identical rows within the same `all_rows` batch (e.g. from an
     # overlapping catch-up search or a pagination re-fetch) would otherwise
     # both pass the `nhash in seen_ids` check and both end up in the output.
     batch_seen: set[str] = set()
-    for i, (rec_date, row_text) in enumerate(all_rows):
+    for i, (rec_date, row_text, doc_fields) in enumerate(all_rows):
         gm = LP_GRANTOR_RE.search(row_text)
         bm = LP_BOOK_PAGE_RE.search(row_text)
         defendant = _clean(gm.group(1)) if gm else row_text[:40]
@@ -926,6 +1130,18 @@ async def _scrape_duval_clerk_search(
             logger.debug(
                 "  Skipping non-mortgage LP: defendant=%s plaintiff=%s",
                 defendant[:40], plaintiff[:40],
+            )
+            continue
+
+        # Defense-in-depth: the recorded document itself states the nature of
+        # the action. If OCR found HOA/condo-lien language, drop the record
+        # even though the plaintiff-name pre-filter let it through (catches
+        # generically-named associations the name regex can't recognize).
+        if doc_fields.get("hoa_lien"):
+            skipped_hoa_doc += 1
+            logger.info(
+                "  Skipping HOA/condo lien LP (doc text confirms non-mortgage): defendant=%s",
+                defendant[:40],
             )
             continue
 
@@ -946,12 +1162,36 @@ async def _scrape_duval_clerk_search(
             continue
 
         notice = _parse_lp_row(row_text, search, effective_date or today, i + 1)
+
+        # Ground-truth address/parcel from the actual recorded document (OCR)
+        # takes priority over anything the index-row regex parser found.
+        if doc_fields.get("address"):
+            notice.address = doc_fields["address"]
+            notice.city    = doc_fields.get("city") or notice.city
+            if doc_fields.get("zip"):
+                notice.zip = doc_fields["zip"]
+            doc_matched += 1
+        if doc_fields.get("parcel_id"):
+            notice.parcel_id = doc_fields["parcel_id"]
+        if doc_fields.get("case_number"):
+            notice.case_number = doc_fields["case_number"]
+
         pending.append((nhash, notice, row_text))
 
     if skipped_non_mortgage:
         logger.info(
             "  Filtered out %d non-mortgage LP rows (HOA/business grantor)",
             skipped_non_mortgage,
+        )
+    if skipped_hoa_doc:
+        logger.info(
+            "  Filtered out %d additional HOA/condo lien LP rows (confirmed via document OCR)",
+            skipped_hoa_doc,
+        )
+    if doc_matched:
+        logger.info(
+            "  Ground-truth address/parcel extracted from recorded document for %d/%d records",
+            doc_matched, len(pending),
         )
 
     # Second pass: LLM for rows missing address

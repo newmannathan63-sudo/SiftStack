@@ -92,6 +92,7 @@ class NoticeData:
     owner_zip: str = ""            # PR/contact mailing zip
     # County assessor / tax fields
     parcel_id: str = ""                # County assessor parcel ID
+    case_number: str = ""              # Court case/UCN (e.g. FL "16-2026-CA-004689-AXXX-MA")
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
     tax_delinquent_years: str = ""     # Number of years delinquent
     # Deceased owner detection
