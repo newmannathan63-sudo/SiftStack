@@ -411,6 +411,15 @@ async def actor_main() -> None:
 
             if not notices:
                 Actor.log.warning("No notices found")
+                # Send Slack ping even on empty runs so operators know the job
+                # ran successfully (vs silently dying) — mirrors the CLI path.
+                if do_notify_slack and config.SLACK_WEBHOOK_URL:
+                    try:
+                        from slack_notifier import send_slack_notification
+                        send_slack_notification([])
+                        Actor.log.info("Slack heartbeat sent for empty run")
+                    except Exception as e:
+                        Actor.log.warning("Slack heartbeat failed: %s", e)
                 return
 
             total = len(notices)
@@ -1116,7 +1125,7 @@ def cli_main() -> None:
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
-            "playbook",
+            "playbook", "sync-apify-output",
         ],
         help=(
             "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
@@ -1126,7 +1135,8 @@ def cli_main() -> None:
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
             "lead-manage = 4 Pillars qualification; setup-sequences = CRM automation; "
-            "niche-sequential = marketing cycle; playbook = SOP generator"
+            "niche-sequential = marketing cycle; playbook = SOP generator; "
+            "sync-apify-output = download latest cloud run's CSVs to local output/"
         ),
     )
     parser.add_argument(
@@ -1162,6 +1172,12 @@ def cli_main() -> None:
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--force-sync",
+        action="store_true",
+        dest="force_sync",
+        help="sync-apify-output: re-download even if this run was already synced",
     )
 
     # PDF import arguments
@@ -1768,6 +1784,20 @@ def cli_main() -> None:
         _run_manage_sold(args)
         return
 
+    # Sync Apify cloud run output — downloads the daily scheduled run's
+    # CSVs from Apify's key-value store to local output/ (never happens
+    # automatically since the Actor's own filesystem is ephemeral cloud).
+    if args.mode == "sync-apify-output":
+        from apify_sync import sync_latest_output
+        result = sync_latest_output(force=getattr(args, "force_sync", False))
+        if result.get("synced"):
+            logging.info("Synced run %s:", result["run_id"])
+            for f in result["files"]:
+                logging.info("  %s", f)
+        else:
+            logging.info("Nothing synced: %s", result.get("reason"))
+        return
+
     # PDF import mode — separate pipeline
     if args.mode == "pdf-import":
         _run_pdf_import(args)
@@ -2075,8 +2105,13 @@ def _run_scrape_pipeline(args, searches) -> None:
 
 
 if __name__ == "__main__":
-    if os.environ.get("APIFY_IS_AT_HOME") or os.environ.get("APIFY_TOKEN"):
-        # Running inside Apify platform or with apify run
+    if os.environ.get("APIFY_IS_AT_HOME"):
+        # Running inside the Apify platform (or local `apify run`, which also
+        # sets this). Deliberately NOT gated on APIFY_TOKEN alone — that var
+        # lives in .env for other reasons (e.g. the local Apify-sync script)
+        # and is present on every local invocation, which previously caused
+        # any `python src/main.py <mode>` call to silently run the full
+        # actor pipeline instead of the requested CLI mode.
         asyncio.run(actor_main())
     else:
         # Standalone CLI

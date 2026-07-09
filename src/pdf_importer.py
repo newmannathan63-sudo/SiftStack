@@ -11,11 +11,10 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-import pypdfium2 as pdfium
 from PIL import Image
 
 from notice_parser import NoticeData
-from image_utils import fix_rotation, ocr_page
+from image_utils import fix_rotation, ocr_page, render_pdf_pages
 
 logger = logging.getLogger(__name__)
 
@@ -72,22 +71,6 @@ Return ONLY a valid JSON array. No markdown fences, no explanation.
 
 OCR text:
 {ocr_text}"""
-
-
-def render_pdf_pages(pdf_path: Path, dpi: int = 200) -> list[Image.Image]:
-    """Render each PDF page to a PIL Image at the specified DPI."""
-    doc = pdfium.PdfDocument(str(pdf_path))
-    images = []
-    for i in range(len(doc)):
-        page = doc[i]
-        scale = dpi / 72  # PDF default is 72 DPI
-        bitmap = page.render(scale=scale)
-        pil_image = bitmap.to_pil()
-        images.append(pil_image)
-    doc.close()
-    logger.info("Rendered %d pages from %s at %d DPI", len(images), pdf_path.name, dpi)
-    return images
-
 
 
 def _has_parcel_id(text: str) -> bool:

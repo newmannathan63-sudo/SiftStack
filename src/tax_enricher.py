@@ -755,81 +755,34 @@ def _probate_property_lookup_fl(notice: "NoticeData", decedent: str, dcpa_page=N
     logger.warning("  No FL property found for decedent: %s (all tiers exhausted)", decedent)
 
 
-_LP_INSTRUMENT_RE = re.compile(r"Instrument\s+#:\s*(\d+)", re.IGNORECASE)
-_FL_STREET_ADDR_RE = re.compile(
-    r"(\d{1,5}\s+[\w\s.'-]+?(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|"
-    r"Boulevard|Blvd|Way|Circle|Cir|Court|Ct|Place|Pl|Terrace|Ter|Parkway|Pkwy|"
-    r"Loop|Run|Trail|Trl|Cove|Cv|Bend|Path|Ridge|Crossing|Xing|Commons)\b\.?)"
-    r"\s*[,.]?\s*([\w][\w\s]*?)\s*[,.]\s*(?:Florida|FL)\s*[,\s]*(\d{5})?",
-    re.IGNORECASE,
-)
+def _parse_dcpa_mailing_address(detail_text: str) -> dict:
+    """Extract the owner's mailing address from a DCPA parcel detail page.
 
-
-_LP_DOC_LINK_RE = re.compile(r"Doc Link:\s*(https?://\S+)", re.IGNORECASE)
-
-
-def _fetch_or_doc_text(instrument: str, book: str, page: str, or_page, raw_text: str = "") -> str:
-    """Navigate to the Duval Clerk OR document viewer and return visible text.
-
-    Priority: stored Doc Link from raw_text → instrument number URL → book/page URL.
-    Handles the or.duvalclerk.com disclaimer redirect automatically.
-    Uses the Playwright page passed in (caller manages browser lifecycle).
+    The page prints, as the first text block, the owner name / mailing street
+    / mailing "City, ST ZIP" — followed by a "Primary Site Address" label and
+    the property's own (situs) address. These are frequently different
+    addresses (verified live: an owner of 2 Duval parcels had a third,
+    distinct mailing address on file) — this pulls the mailing block only.
     """
-    base = "https://or.duvalclerk.com"
-    try:
-        from duval_clerk_scraper import DUVAL_CLERK_BASE_URL as _base
-        base = _base
-    except Exception:
-        pass
-
-    # Build URL candidates — DocLink from scraper takes priority
-    candidates: list[str] = []
-    doc_link_m = _LP_DOC_LINK_RE.search(raw_text or "")
-    if doc_link_m:
-        candidates.append(doc_link_m.group(1))
-    if instrument:
-        candidates += [
-            f"{base}/Search/Image/DocType/OR/InstrumentNumber/{instrument}",
-            f"{base}/Search/Details?InstrumentNumber={instrument}",
-        ]
-    if book and page:
-        candidates.append(f"{base}/Search/Image/DocType/OR/Book/{book}/Page/{page}")
-
-    _DOC_KEYWORDS = ("lis pendens", "mortgage", "property", "parcel", "grantor",
-                     "plaintiff", "defendant", "real property", "legal description")
-
-    for url in candidates:
-        try:
-            or_page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-
-            # Accept disclaimer redirect if the site bounces us to ToS
-            if "disclaimer" in or_page.url.lower():
-                try:
-                    btn = or_page.query_selector("input[type='submit'], button[type='submit']")
-                    if btn:
-                        btn.click()
-                        or_page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                        # Navigate to the intended URL now that disclaimer is accepted
-                        or_page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                except Exception:
-                    pass
-
-            # Wait briefly for JS-rendered content
-            try:
-                or_page.wait_for_load_state("networkidle", timeout=8_000)
-            except Exception:
-                pass
-
-            text    = or_page.inner_text("body") or ""
-            stripped = re.sub(r"\s+", " ", text).strip()
-            if len(stripped) > 200 and any(kw in stripped.lower() for kw in _DOC_KEYWORDS):
-                logger.debug("  OR doc text fetched via %s (%d chars)", url, len(stripped))
-                return stripped
-            logger.debug("  OR doc URL %s: page too short or no doc keywords (%d chars)", url, len(stripped))
-        except Exception as e:
-            logger.debug("  OR doc URL %s failed: %s", url, e)
-
-    return ""
+    result: dict = {}
+    idx = detail_text.find("Primary Site Address")
+    if idx == -1:
+        return result
+    lines = [l.strip() for l in detail_text[:idx].splitlines() if l.strip()]
+    if len(lines) < 3:
+        return result
+    street_line, csz_line = lines[-2], lines[-1]
+    m = re.match(
+        r"([\w\s.'-]+?),?\s*(?:FL|Florida)\.?\s*(\d{5}(?:-\d{4})?)?$",
+        csz_line, re.IGNORECASE,
+    )
+    if m and street_line:
+        result["owner_street"] = street_line
+        result["owner_city"]  = m.group(1).strip().rstrip(",")
+        result["owner_state"] = "FL"
+        if m.group(2):
+            result["owner_zip"] = m.group(2)
+    return result
 
 
 def _dcpa_first_name_matches(dcpa_owner: str, expected_first: str) -> bool:
@@ -846,21 +799,31 @@ def _dcpa_first_name_matches(dcpa_owner: str, expected_first: str) -> bool:
 
 
 def _lis_pendens_address_lookup(notices: list["NoticeData"]) -> None:
-    """DCPA owner-name lookup for Duval County lis pendens records without addresses.
+    """DCPA lookup for Duval County lis pendens records — property address
+    fallback (name search) plus owner mailing address (always attempted).
 
     Grantor (owner_name) comes from the Duval Clerk index in LAST FIRST format.
+    Property address itself is normally already set by this point — the
+    scraper (duval_clerk_scraper.py) fetches and OCRs the actual recorded
+    document at scrape time, which is ground truth. The tiers below only run
+    when that failed for some reason:
     Tier 1 : DCPA name search (Playwright) — requires first-name token match
-    Tier 1b: OR document text fetch — parses address from the filed document
+    Tier 1a: DCPA detail page — check for secondary/trust owners
     Tier 2 : Tracerfy instant trace
     Tier 3 : People search (Serper + Firecrawl + LLM)
+
+    Separately — regardless of which of the above found the property address,
+    or whether OCR already did — looks up the owner's actual mailing address
+    via the DCPA parcel-detail page for the confirmed parcel_id (frequently a
+    different address than any property they own).
     Updates notices in-place.
     """
     candidates = [
         n for n in notices
         if n.notice_type == "lis_pendens"
         and n.county.lower() == "duval"
-        and not n.address.strip()
         and n.owner_name.strip()
+        and (not n.address.strip() or (n.parcel_id.strip() and not n.owner_street.strip()))
     ]
     if not candidates:
         logger.info("  No lis pendens candidates for DCPA address lookup")
@@ -897,12 +860,9 @@ def _lis_pendens_address_lookup_impl(candidates: list) -> None:
         dcpa_pw_ctx = sync_playwright().start()
         dcpa_browser = dcpa_pw_ctx.chromium.launch(headless=True)
         dcpa_page = dcpa_browser.new_page()
-        # Second page for OR document viewer (same browser, separate tab)
-        or_doc_page = dcpa_browser.new_page()
         logger.debug("  DCPA browser ready for lis pendens lookup")
     except Exception as e:
         logger.warning("  Could not start DCPA browser: %s", e)
-        or_doc_page = None
 
     try:
         # Patterns for OR-index name artifacts
@@ -937,16 +897,13 @@ def _lis_pendens_address_lookup_impl(candidates: list) -> None:
             first_no_sfx = re.sub(r"\s+", " ", first_no_sfx).strip()
             first_last = f"{first_no_sfx} {last}".strip() if first_no_sfx else last
 
-            # Extract instrument # and book/page from raw_text for OR doc lookup
-            instr_m = _LP_INSTRUMENT_RE.search(notice.raw_text or "")
-            bk_m    = re.search(r"Book/Page:\s*(\d+)/(\d+)", notice.raw_text or "", re.IGNORECASE)
-            instrument = instr_m.group(1) if instr_m else ""
-            book       = bk_m.group(1) if bk_m else ""
-            page       = bk_m.group(2) if bk_m else ""
-
             # ── Tier 1: DCPA by grantor name (with first-name guard) ──────
+            # Skipped entirely if the ground-truth document OCR (upstream in
+            # duval_clerk_scraper.py) already found the real property address —
+            # a name-only match is unreliable when an owner has multiple
+            # parcels and must never override a confirmed address.
             dcpa_results: list[dict] = []
-            if dcpa_page is not None:
+            if not notice.address.strip() and dcpa_page is not None:
                 try:
                     dcpa_results = _search_dcpa_by_name(last, first_no_sfx, dcpa_page)
                     if not dcpa_results and first_no_sfx != first:
@@ -981,19 +938,19 @@ def _lis_pendens_address_lookup_impl(candidates: list) -> None:
                                 "  Tier 1 (DCPA): %s, %s (matched: %s, score=%.2f)",
                                 notice.address, notice.city, best["owner_name"], score,
                             )
-                            continue
-                        logger.debug(
-                            "  DCPA match rejected: score=%.2f first_name_ok=%s owner=%s",
-                            score, _dcpa_first_name_matches(best["owner_name"], first),
-                            best["owner_name"],
-                        )
+                        else:
+                            logger.debug(
+                                "  DCPA match rejected: score=%.2f first_name_ok=%s owner=%s",
+                                score, _dcpa_first_name_matches(best["owner_name"], first),
+                                best["owner_name"],
+                            )
                 except Exception as e:
                     logger.debug("  DCPA failed for %s: %s", grantor, e)
 
             # ── Tier 1a: DCPA detail page — check for secondary owners ──
             # Handles trust-owned properties and co-owners where the grantor is
             # listed as a secondary (non-primary) owner on the DCPA parcel page.
-            if dcpa_results and dcpa_page is not None and not notice.address.strip():
+            if not notice.address.strip() and dcpa_results and dcpa_page is not None:
                 first_tok = first.split()[0] if first else ""
                 for result in dcpa_results[:5]:
                     re_clean = result.get("re_number", "").replace("-", "")
@@ -1005,9 +962,10 @@ def _lis_pendens_address_lookup_impl(candidates: list) -> None:
                             wait_until="domcontentloaded",
                             timeout=15000,
                         )
-                        detail_text = (dcpa_page.inner_text("body") or "").upper()
-                        last_present  = last in detail_text
-                        first_present = not first_tok or first_tok in detail_text
+                        detail_text = dcpa_page.inner_text("body") or ""
+                        detail_upper = detail_text.upper()
+                        last_present  = last in detail_upper
+                        first_present = not first_tok or first_tok in detail_upper
                         if last_present and first_present:
                             notice.address   = result["address"]
                             notice.city      = result.get("city", "Jacksonville")
@@ -1024,31 +982,38 @@ def _lis_pendens_address_lookup_impl(candidates: list) -> None:
                     except Exception as e:
                         logger.debug("  DCPA detail check failed for %s (%s): %s",
                                      grantor, re_clean, e)
-                if notice.address.strip():
-                    continue
 
-            # ── Tier 1b: OR document text — parse address from filed document ──
-            if or_doc_page is not None and (instrument or (book and page) or _LP_DOC_LINK_RE.search(notice.raw_text or "")):
+            # ── Owner mailing address (by confirmed parcel) ─────────────
+            # Independent of how the property address was found (document
+            # OCR, Tier 1, or Tier 1a) — looks up the DCPA parcel-detail page
+            # for the confirmed parcel and captures the owner's actual
+            # mailing address, which is frequently a DIFFERENT address than
+            # any property they own.
+            if notice.parcel_id.strip() and not notice.owner_street.strip() and dcpa_page is not None:
+                re_clean = notice.parcel_id.replace("-", "")
                 try:
-                    doc_text = _fetch_or_doc_text(instrument, book, page, or_doc_page, notice.raw_text or "")
-                    if doc_text:
-                        m = _FL_STREET_ADDR_RE.search(doc_text)
-                        if m:
-                            addr = re.sub(r"\s+", " ", m.group(1)).strip().rstrip(",.")
-                            city = re.sub(r"\s+", " ", m.group(2)).strip().rstrip(",.")
-                            zip_ = m.group(3) or ""
-                            if addr and not re.search(r"\bSte\b|\bSuite\b", addr, re.I):
-                                notice.address = addr
-                                notice.city    = city or "Jacksonville"
-                                notice.state   = "FL"
-                                if zip_:
-                                    notice.zip = zip_
-                                logger.info(
-                                    "  Tier 1b (OR doc): %s, %s", notice.address, notice.city
-                                )
-                                continue
+                    dcpa_page.goto(
+                        f"https://paopropertysearch.coj.net/Basic/Detail.aspx?RE={re_clean}",
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    mailing = _parse_dcpa_mailing_address(dcpa_page.inner_text("body") or "")
+                    if mailing.get("owner_street"):
+                        notice.owner_street = mailing["owner_street"]
+                        notice.owner_city   = mailing.get("owner_city", "")
+                        notice.owner_state  = mailing.get("owner_state", "FL")
+                        notice.owner_zip    = mailing.get("owner_zip", "")
+                        logger.info(
+                            "  Owner mailing address (DCPA parcel %s): %s, %s, %s %s",
+                            notice.parcel_id, notice.owner_street, notice.owner_city,
+                            notice.owner_state, notice.owner_zip,
+                        )
                 except Exception as e:
-                    logger.debug("  OR doc text failed for %s: %s", grantor, e)
+                    logger.debug("  DCPA mailing address lookup failed for parcel %s: %s",
+                                 notice.parcel_id, e)
+
+            if notice.address.strip():
+                continue
 
             # ── Tier 2: People search (Serper + Firecrawl + LLM) ────────
             # Note: Tracerfy requires a known street address as input — not usable here

@@ -12,6 +12,7 @@ cookies.json
 datasift_cookies.json
 dropbox_state.json
 photo_state.json
+apify_sync_state.json
 *.tmp
 *.bak
 

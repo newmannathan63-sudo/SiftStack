@@ -1,9 +1,12 @@
-"""Shared image utilities for OCR — used by both pdf_importer.py and photo_importer.py."""
+"""Shared image utilities for OCR — used by pdf_importer.py, photo_importer.py,
+and duval_clerk_scraper.py's lis pendens document OCR."""
 
 import logging
 import os
 import re
+from pathlib import Path
 
+import pypdfium2 as pdfium
 from PIL import Image
 import pytesseract
 
@@ -53,3 +56,32 @@ def ocr_page(image: Image.Image, psm: int = 3) -> str:
     """
     text = pytesseract.image_to_string(image, config=f"--psm {psm}")
     return text
+
+
+def render_pdf_pages(pdf_path: Path, dpi: int = 200) -> list[Image.Image]:
+    """Render each PDF page to a PIL Image at the specified DPI."""
+    doc = pdfium.PdfDocument(str(pdf_path))
+    images = []
+    for i in range(len(doc)):
+        page = doc[i]
+        scale = dpi / 72  # PDF default is 72 DPI
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        images.append(pil_image)
+    doc.close()
+    logger.info("Rendered %d pages from %s at %d DPI", len(images), pdf_path.name, dpi)
+    return images
+
+
+def render_pdf_bytes(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
+    """Render each page of an in-memory PDF (bytes) to a PIL Image at the given DPI."""
+    doc = pdfium.PdfDocument(pdf_bytes)
+    images = []
+    for i in range(len(doc)):
+        page = doc[i]
+        scale = dpi / 72
+        bitmap = page.render(scale=scale)
+        images.append(bitmap.to_pil())
+    doc.close()
+    logger.info("Rendered %d pages from in-memory PDF at %d DPI", len(images), dpi)
+    return images

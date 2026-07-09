@@ -656,19 +656,31 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
 
         if await filter_link.count() > 0:
             await filter_link.first.click()
-            await page.wait_for_timeout(2000)
             logger.debug("Opened filter panel")
         else:
             logger.warning("No Filter Records link found")
             return False
 
-        await _dismiss_popups(page)
-        await _screenshot(page, "filter_opened")
+        # NOTE: do NOT call _dismiss_popups() again here. It removes
+        # #asideOverlay / [class*="AsideOverlay"] to unblock clicks behind a
+        # blocking backdrop — but that's exactly the filter panel's own
+        # overlay we just opened. Calling it post-click was silently
+        # destroying the freshly-opened panel, so the search input below
+        # never appeared ("Filter block search input not found").
 
-        # Type "Lists" in the "Add new filter block" search input
+        # Type "Lists" in the "Add new filter block" search input.
+        # The panel animates in — wait for the input itself rather than a
+        # fixed sleep, since a blind ~2s wait was intermittently too short
+        # under headless load and caused this step to silently no-op.
         filter_search = page.locator('#RecordsFilters__Filter_Blocks__Search')
         if await filter_search.count() == 0:
             filter_search = page.locator('input[placeholder*="filter block"]')
+        try:
+            await filter_search.first.wait_for(state="visible", timeout=6000)
+        except Exception:
+            pass
+
+        await _screenshot(page, "filter_opened")
 
         if await filter_search.count() > 0:
             await filter_search.first.click()
@@ -696,6 +708,10 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         # Now a list picker appears with "Search for lists..." input and a dropdown.
         # Type the list name to search, then click the matching option.
         list_search = page.locator('input[placeholder*="Search for lists"]')
+        try:
+            await list_search.first.wait_for(state="visible", timeout=5000)
+        except Exception:
+            pass
         if await list_search.count() > 0:
             await list_search.first.fill(list_name)
             await page.wait_for_timeout(2000)
@@ -737,8 +753,29 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
-async def _select_all_records(page: Page) -> bool:
-    """Select all records on the current page. Returns True if selected."""
+async def _select_all_records(page: Page, retries: int = 2) -> bool:
+    """Select all records on the current page. Returns True if selected.
+
+    Retries a few times with a wait in between: right after an upload,
+    DataSift indexes the new rows into the filtered list asynchronously,
+    so the grid can briefly show 0 matching rows even though the filter
+    itself applied correctly.
+    """
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            logger.info(
+                "No records visible yet (attempt %d/%d) — waiting 10s for "
+                "DataSift to finish indexing before retrying select-all",
+                attempt, retries,
+            )
+            await page.wait_for_timeout(10000)
+        selected = await _select_all_records_once(page)
+        if selected:
+            return True
+    return False
+
+
+async def _select_all_records_once(page: Page) -> bool:
     try:
         # Dismiss popups aggressively — the notification popup blocks all clicks
         await _dismiss_popups(page)
@@ -748,54 +785,32 @@ async def _select_all_records(page: Page) -> bool:
 
         await _screenshot(page, "before_select_all")
 
-        # Strategy 1: Find the header checkbox position via JS, then use Playwright
-        # mouse.click to properly trigger React's event system.
-        # The header checkbox is near the "OWNER" column header text.
-        header_pos = await page.evaluate("""() => {
-            // Find the OWNER header text element
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                if (el.textContent.trim() === 'OWNER' && el.children.length === 0) {
-                    const rect = el.getBoundingClientRect();
-                    // The header checkbox is in the same row, to the left
-                    // Find the nearest checkbox (same vertical position)
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    let best = null;
-                    let bestDist = Infinity;
-                    for (const cb of checkboxes) {
-                        if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                        const cbRect = cb.getBoundingClientRect();
-                        // Must be roughly same Y position (within 30px) and to the left
-                        const yDist = Math.abs(cbRect.top - rect.top);
-                        if (yDist < 30 && cbRect.left < rect.left) {
-                            if (yDist < bestDist) {
-                                bestDist = yDist;
-                                best = cbRect;
-                            }
-                        }
-                    }
-                    if (best) {
-                        return {x: best.left + best.width/2, y: best.top + best.height/2};
-                    }
-                }
-            }
-            return null;
-        }""")
+        # Strategy 1: The header checkbox is a dropdown trigger, not a plain
+        # checkbox — it's a <label class="Checkbox__StyledLabel-..."> that
+        # wraps both the checkbox box AND a small <svg> chevron. Clicking it
+        # opens a menu with "Select visible (N)" / "Select all (N)" options
+        # (N = total matching the current filter, across all pages). The old
+        # approach of locating an exact-text "OWNER" leaf element to find the
+        # header checkbox's position no longer matches the current DOM (the
+        # header text is nested, never a bare leaf node), so it always fell
+        # through to per-row clicking below — which can only ever select the
+        # current page (e.g. 10 of 39 records).
+        header_dropdown = page.locator('label[class*="Checkbox__StyledLabel"]:has(svg)').first
+        opened_dropdown = False
+        if await header_dropdown.count() > 0:
+            await header_dropdown.click()
+            await page.wait_for_timeout(1200)
+            select_all_opt = page.get_by_text("Select all (", exact=False)
+            if await select_all_opt.count() > 0:
+                await select_all_opt.first.click()
+                await page.wait_for_timeout(1500)
+                opened_dropdown = True
+                logger.info("Selected all records via header dropdown 'Select all (N)'")
 
-        if header_pos:
-            # Use Playwright mouse click which properly triggers React events
-            await page.mouse.click(header_pos["x"], header_pos["y"])
-            clicked_header = f"clicked at ({header_pos['x']:.0f}, {header_pos['y']:.0f})"
-            logger.info("Clicked header checkbox via coordinates: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            clicked_header = None
-
-        if clicked_header:
-            logger.info("Clicked header checkbox via JS: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            # Strategy 2: Click each record checkbox individually via JS
+        if not opened_dropdown:
+            # Strategy 2 (fallback): click each visible record checkbox via JS.
+            # Only selects the current page — better than nothing if the
+            # dropdown menu isn't present in some other view.
             clicked_count = await page.evaluate("""() => {
                 const checkboxes = document.querySelectorAll('input[type="checkbox"]');
                 let clicked = 0;
@@ -806,17 +821,22 @@ async def _select_all_records(page: Page) -> bool:
                 }
                 return clicked;
             }""")
-            logger.info("Clicked %d checkboxes via JS (all non-toggle)", clicked_count)
+            logger.warning(
+                "Header dropdown not found — fell back to clicking %d checkboxes "
+                "on the current page only (may not cover all matching records)",
+                clicked_count,
+            )
             await page.wait_for_timeout(1500)
 
-        await _screenshot(page, "records_selected_header")
+            # Legacy fallback: some views may show a "Select all X records" banner
+            # instead of the dropdown menu.
+            select_all_link = page.locator('text="Select all"')
+            if await select_all_link.count() > 0:
+                await select_all_link.first.click()
+                await page.wait_for_timeout(1000)
+                logger.debug("Clicked 'Select all' records link")
 
-        # After checking the header checkbox, a "Select All X records" banner may appear
-        select_all_link = page.locator('text="Select all"')
-        if await select_all_link.count() > 0:
-            await select_all_link.first.click()
-            await page.wait_for_timeout(1000)
-            logger.debug("Clicked 'Select all' records link")
+        await _screenshot(page, "records_selected_header")
 
         # Verify: check if Manage or Send To buttons are now visible
         manage_visible = await page.locator('button:has-text("Manage")').count() > 0
@@ -1108,6 +1128,21 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
 
         await _screenshot(page, "skip_submitted")
 
+        # The wizard can reject the submit silently (e.g. insufficient balance
+        # when the unlimited skip-trace add-on isn't active) — the button
+        # click still "succeeds" as a Playwright action, but the modal stays
+        # on Review instead of advancing to "Sent!". Check for that before
+        # declaring success.
+        body_text = await page.inner_text("body")
+        if "Insufficient balance" in body_text or "insufficient balance" in body_text.lower():
+            result["message"] = (
+                "Skip trace rejected: insufficient DataSift balance / no active "
+                "unlimited skip-trace add-on — add credits or subscribe at "
+                "$97/mo before retrying"
+            )
+            logger.error(result["message"])
+            return result
+
         # Skip trace runs in background — we don't need to wait
         result["success"] = True
         result["message"] = "Skip trace started - track progress in Activity > Skip Trace tab"
@@ -1287,6 +1322,16 @@ async def upload_datasift_split(
                 if i < len(csv_infos) - 1:
                     logger.info("Waiting 15s before next upload...")
                     await page.wait_for_timeout(15000)
+
+            # Settle wait after the *last* upload too — DataSift ingests the
+            # CSV into the list asynchronously, and enrich/skip-trace filter
+            # by that list immediately after. Without this, a single-CSV
+            # upload (the common case) jumps straight into filtering before
+            # the new rows are indexed, so the Records grid shows 0 matches
+            # and select-all silently finds no checkboxes to click.
+            if all_success and (enrich or skip_trace):
+                logger.info("Waiting 15s for DataSift to index uploaded records...")
+                await page.wait_for_timeout(15000)
 
             combined = {
                 "success": all_success,
