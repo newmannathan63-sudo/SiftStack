@@ -753,22 +753,29 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
-async def _select_all_records(page: Page, retries: int = 2) -> bool:
+async def _select_all_records(page: Page, retries: int = 9) -> bool:
     """Select all records on the current page. Returns True if selected.
 
     Retries a few times with a wait in between: right after an upload,
     DataSift indexes the new rows into the filtered list asynchronously,
     so the grid can briefly show 0 matching rows even though the filter
-    itself applied correctly.
+    itself applied correctly. Verified live (2026-07-09) that indexing can
+    take longer than a couple of 10s retries cover, hence the wider budget.
+    Widened again (2026-08-06) after an audit found this step failing on
+    every run since ~7/28 with 0 checkboxes on the page — the fallback JS
+    click found nothing because the list still had 0 indexed rows at the
+    old 60s (4x15s) budget's end. 9x20s (~3 min) matches observed indexing
+    latency; a live 191-record list select-all worked instantly, confirming
+    the header-dropdown selector itself is not the bug.
     """
     for attempt in range(retries + 1):
         if attempt > 0:
             logger.info(
-                "No records visible yet (attempt %d/%d) — waiting 10s for "
+                "No records visible yet (attempt %d/%d) — waiting 20s for "
                 "DataSift to finish indexing before retrying select-all",
                 attempt, retries,
             )
-            await page.wait_for_timeout(10000)
+            await page.wait_for_timeout(20000)
         selected = await _select_all_records_once(page)
         if selected:
             return True
@@ -1330,8 +1337,8 @@ async def upload_datasift_split(
             # the new rows are indexed, so the Records grid shows 0 matches
             # and select-all silently finds no checkboxes to click.
             if all_success and (enrich or skip_trace):
-                logger.info("Waiting 15s for DataSift to index uploaded records...")
-                await page.wait_for_timeout(15000)
+                logger.info("Waiting 30s for DataSift to index uploaded records...")
+                await page.wait_for_timeout(30000)
 
             combined = {
                 "success": all_success,

@@ -130,7 +130,24 @@ _GENERIC_ASSOCIATION_INC_RE = re.compile(
 )
 
 
-def _is_mortgage_preforeclosure(plaintiff: str, defendant: str) -> bool:
+def _plaintiff_is_mortgage_lender(plaintiff: str) -> bool:
+    """Cheap pre-filter on the plaintiff (DirectName) alone: True unless the
+    plaintiff itself is an HOA/condo association or contractor lien-filer.
+
+    Deliberately does NOT check the defendant name — used to gate the OCR
+    document fetch, before doc_fields exists. The defendant-business check
+    lives in `_is_mortgage_preforeclosure` and is checked separately (with
+    OCR ground truth available to override it) once the document has been
+    fetched.
+    """
+    if _NON_MORTGAGE_PLAINTIFF_RE.search(plaintiff):
+        return False
+    if _GENERIC_ASSOCIATION_INC_RE.search(plaintiff):
+        return False
+    return True
+
+
+def _is_mortgage_preforeclosure(plaintiff: str, defendant: str, doc_fields: dict | None = None) -> bool:
     """Return True only if this LP row looks like a mortgage preforeclosure.
 
     IMPORTANT — OR index column mapping (verified 2026-06-12):
@@ -140,13 +157,20 @@ def _is_mortgage_preforeclosure(plaintiff: str, defendant: str) -> bool:
     Two rules:
       1. Defendant (IndirectName / property owner) must be a person, not a business.
       2. Plaintiff (DirectName) must not be an HOA, condo association, or contractor.
+
+    Rule 1 has a documented blind spot: the OR index only exposes a single
+    "First Indirect Name" per filing, which for multi-defendant mortgage
+    cases can be a co-defendant lienholder (HOA, hospital, etc.) rather than
+    the actual homeowner. If `doc_fields` (OCR of the actual recorded
+    document) confirms mortgage-foreclosure language, that overrides the
+    business-name-defendant rejection.
     """
     from config import BUSINESS_RE
+    if not _plaintiff_is_mortgage_lender(plaintiff):
+        return False
     if BUSINESS_RE.search(defendant):
-        return False
-    if _NON_MORTGAGE_PLAINTIFF_RE.search(plaintiff):
-        return False
-    if _GENERIC_ASSOCIATION_INC_RE.search(plaintiff):
+        if doc_fields and doc_fields.get("mortgage_confirmed"):
+            return True
         return False
     return True
 
@@ -187,6 +211,18 @@ _LP_DOC_HOA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Positive confirmation the recorded document is a mortgage foreclosure.
+# FL lis pendens notices for mortgage foreclosures use this statutory
+# phrasing ("...seeking to foreclose a mortgage on the following real
+# property..."). Used to override the defendant-business-name heuristic:
+# the county's OR index only exposes a single "First Indirect Name" per
+# filing, which can land on a co-defendant lienholder (HOA, hospital, etc.)
+# instead of the actual homeowner when a case has multiple defendants
+# (verified 2026-07-14 — "Lakeview Loan Servicing, LLC v. Servis" case had
+# Shands Jacksonville Medical Center Inc. and Wells Creek West Homeowners
+# Association, Inc. as co-defendants alongside the actual homeowners).
+_LP_DOC_MORTGAGE_RE = re.compile(r"foreclose\s+a\s+mortgage", re.IGNORECASE)
+
 
 def _parse_lp_document_text(ocr_text: str) -> dict:
     """Extract property address / parcel ID / case number / HOA-lien signal
@@ -225,6 +261,9 @@ def _parse_lp_document_text(ocr_text: str) -> dict:
 
     if _LP_DOC_HOA_RE.search(ocr_text):
         result["hoa_lien"] = True
+
+    if _LP_DOC_MORTGAGE_RE.search(ocr_text):
+        result["mortgage_confirmed"] = True
 
     return result
 
@@ -761,7 +800,17 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
     rows = await result_tbl.query_selector_all("tr")
     results: list[tuple[str, str, dict]] = []
     doc_fetch_count = 0
-    for row in rows[1:]:  # row 0 is the header
+    # NOTE: `.k-grid-content table` is Kendo's scrollable grid-BODY table —
+    # its header lives in a separate `.k-grid-header` table, so every <tr>
+    # here is already a data row (verified live 2026-07-14: a 5-row search
+    # returned exactly 5 <tr>, tr[0] being real data, not a header). A prior
+    # version of this code did `rows[1:]` assuming row 0 was a header, which
+    # silently dropped the first record of every single search. Any genuine
+    # <th>-based header row (e.g. if a fallback `table` selector above ever
+    # matches a full grid incl. header) is already filtered out below by the
+    # `len(cells) < 5` check, since `query_selector_all("td")` won't match
+    # <th> cells — so no manual row-skip is needed here.
+    for row in rows:
         try:
             cells = await row.query_selector_all("td")
             if len(cells) < 5:
@@ -811,12 +860,16 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
             if doc_link:
                 row_text += f"\nDoc Link: {doc_link}"
 
-            # Ground-truth document fetch — only for rows that already look
-            # like a real mortgage preforeclosure (cheap pre-filter avoids
-            # wasting a click+download+OCR round-trip on obvious HOA/contractor
-            # lien rows, which get dropped later in the caller anyway).
+            # Ground-truth document fetch — gated on the plaintiff alone (cheap
+            # pre-filter avoids wasting a click+download+OCR round-trip on
+            # obvious HOA/contractor lien rows, which get dropped later in the
+            # caller anyway). Deliberately NOT gated on the defendant-business
+            # check too: the index's single "First Indirect Name" can be a
+            # co-defendant lienholder rather than the actual homeowner on
+            # multi-defendant mortgage cases, so those rows still need OCR to
+            # get a fair shot at the mortgage_confirmed override below.
             doc_fields: dict = {}
-            if _is_mortgage_preforeclosure(plaintiff, defendant) and len(cells) > 3 + _offset:
+            if _plaintiff_is_mortgage_lender(plaintiff) and len(cells) > 3 + _offset:
                 doc_fields = await _fetch_and_ocr_lp_document(page, cells[3 + _offset])
                 if doc_fields:
                     doc_fetch_count += 1
@@ -1125,7 +1178,7 @@ async def _scrape_duval_clerk_search(
         plaintiff_m = re.search(r"^Grantee:\s*(.+)$", row_text, re.MULTILINE)
         plaintiff = _clean(plaintiff_m.group(1)) if plaintiff_m else ""
 
-        if not _is_mortgage_preforeclosure(plaintiff, defendant):
+        if not _is_mortgage_preforeclosure(plaintiff, defendant, doc_fields):
             skipped_non_mortgage += 1
             logger.debug(
                 "  Skipping non-mortgage LP: defendant=%s plaintiff=%s",

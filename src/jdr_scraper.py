@@ -40,6 +40,14 @@ JDR_CATEGORY_MAP: dict[str, str] = {
     "tax_sale":    "Tax Deeds",
 }
 
+# JDR's search_date field filters on an internal entry date that lags behind
+# when a notice actually becomes visible/searchable — records can appear in a
+# search for a given date days after that date has passed. A daily incremental
+# scraper using only the prior run's date as the floor permanently misses any
+# notice that lags past that point. Re-check this many days back every run;
+# hash-based seen_ids dedup (verified collision-free) makes the overlap safe.
+JDR_LOOKBACK_BUFFER_DAYS = 7
+
 
 # ── Florida address + name patterns ───────────────────────────────────
 
@@ -769,7 +777,12 @@ async def _get_result_count(page: Page) -> int | None:
     """Extract total result count from the page text (e.g. 'Found 40 Records')."""
     try:
         body = await page.inner_text("body")
-        m = re.search(r"(?:Found|Displaying|Total)\s+(\d+)\s+Record", body, re.IGNORECASE)
+        # JDR's actual format: "Displaying Records 1 to 68" — total is the
+        # second number, not the first (verified live 2026-07-09).
+        m = re.search(r"Displaying\s+Records?\s+\d+\s+to\s+(\d+)", body, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"(?:Found|Total)\s+(\d+)\s+Record", body, re.IGNORECASE)
         if m:
             return int(m.group(1))
         m = re.search(r"(\d+)\s+(?:result|record|notice)s?\s+found", body, re.IGNORECASE)
@@ -827,7 +840,15 @@ async def _scrape_jdr_search(
     )
 
     today = datetime.now().strftime("%Y-%m-%d")
-    start = since_date or (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    # date_added tracks when *we* first captured the notice, not the widened
+    # search floor below — keep it as the caller's since_date (or today).
+    date_added_default = since_date or today
+    if since_date:
+        start = (
+            datetime.strptime(since_date, "%Y-%m-%d") - timedelta(days=JDR_LOOKBACK_BUFFER_DAYS)
+        ).strftime("%Y-%m-%d")
+    else:
+        start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
     ok = await _submit_search_form(page, search, start, today)
     if not ok:
@@ -865,13 +886,12 @@ async def _scrape_jdr_search(
             if nhash in seen_ids:
                 logger.debug("  Skipping seen notice hash=%s", nhash)
                 continue
-            # Use the search start date as date_added — JDR's search already
-            # filters by date, so all returned records belong to the search window.
-            # Parsed notice text dates (FIRST_PUB_RE) reflect the *first* publication
-            # date, which can be earlier for two-run notices (e.g. Jun 22 + Jun 29).
+            # Use date_added_default (the un-widened since_date), not the
+            # lookback-buffered `start` used only to query JDR. Parsed notice
+            # text dates (FIRST_PUB_RE) reflect the *first* publication date,
+            # which can be earlier for two-run notices (e.g. Jun 22 + Jun 29).
             # Skipping on that parsed date would drop valid second-publication records.
-            effective_date = start
-            notice = _parse_jdr_notice(block_text, search, effective_date or today, seq_base + i + 1)
+            notice = _parse_jdr_notice(block_text, search, date_added_default, seq_base + i + 1)
             pending.append((nhash, notice, block_text))
 
         # Second pass: parallel LLM for all notices that need it
@@ -911,7 +931,11 @@ async def _scrape_jdr_search(
                 seen_ids[nhash] = notice.date_added or today
                 notices.append(notice)
 
-        # Pagination
+        # Pagination — JDR always renders a "Next" link even when every result
+        # already fits on the current page (it just points back to start_round=0,
+        # not a real next page), so only follow it if there's actually more to see.
+        if total is not None and len(blocks) >= total:
+            break
         if not await _click_next_page(page):
             break
 

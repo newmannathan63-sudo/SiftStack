@@ -301,6 +301,20 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
 # ── Pipeline ─────────────────────────────────────────────────────────
 
 
+def _run_coro_sync(coro):
+    """Run an async coroutine from sync code, whether or not a loop is
+    already running (the Apify actor entrypoint keeps one running via
+    asyncio.run(actor_main()); plain CLI entry points do not)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+
+
 def run_enrichment_pipeline(
     notices: list[NoticeData],
     opts: PipelineOptions,
@@ -436,7 +450,7 @@ def run_enrichment_pipeline(
         logger.info("── Step 3d0: Lis Pendens CORE Case Lookup (%d candidates) ──", len(lp_with_case_no))
         try:
             from duval_core_scraper import lookup_case_addresses
-            matched = asyncio.run(lookup_case_addresses(lp_with_case_no))
+            matched = _run_coro_sync(lookup_case_addresses(lp_with_case_no))
             logger.info("  Address matched via CORE: %d/%d", matched, len(lp_with_case_no))
         except ImportError:
             logger.warning("  duval_core_scraper not available — skipping")

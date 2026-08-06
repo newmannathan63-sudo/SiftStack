@@ -191,6 +191,13 @@ async def actor_main() -> None:
         do_ds_upload = actor_input.get("upload_datasift", True)
         do_enrich_ds = actor_input.get("enrich_datasift", True)
         do_skip_trace_ds = actor_input.get("skip_trace_datasift", True)
+        # Kill switch: overrides task input regardless of its saved settings.
+        # Set DATASIFT_UPLOAD_DISABLED=true as an actor env var to pause all
+        # DataSift upload/enrich/skip-trace until the record-selection bug
+        # (header dropdown selector drift) is fixed and verified.
+        if os.environ.get("DATASIFT_UPLOAD_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+            do_ds_upload = False
+            Actor.log.warning("DATASIFT_UPLOAD_DISABLED env var set — skipping DataSift upload/enrich/skip-trace")
 
         # Buy box / filter toggles
         include_vacant = actor_input.get("include_vacant", False)
@@ -941,6 +948,9 @@ def _run_csv_import(args) -> None:
     # DataSift upload (same logic as daily/historical mode)
     _has_ds_creds = bool(config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD)
     _want_ds_upload = (getattr(args, "upload_datasift", False) or _has_ds_creds) and not getattr(args, "no_upload_datasift", False)
+    if os.environ.get("DATASIFT_UPLOAD_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        _want_ds_upload = False
+        logging.warning("DATASIFT_UPLOAD_DISABLED env var set — skipping DataSift upload/enrich/skip-trace")
     if _want_ds_upload:
         from datasift_formatter import write_datasift_split_csvs
         from datasift_uploader import upload_datasift_split, upload_to_datasift
@@ -2048,6 +2058,9 @@ def _run_scrape_pipeline(args, searches) -> None:
     upload_result = None
     _has_ds_creds = bool(config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD)
     _want_ds_upload = (getattr(args, "upload_datasift", False) or _has_ds_creds) and not getattr(args, "no_upload_datasift", False)
+    if os.environ.get("DATASIFT_UPLOAD_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        _want_ds_upload = False
+        logging.warning("DATASIFT_UPLOAD_DISABLED env var set — skipping DataSift upload/enrich/skip-trace")
     if _want_ds_upload:
         from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
         from datasift_uploader import upload_to_datasift, upload_datasift_split
