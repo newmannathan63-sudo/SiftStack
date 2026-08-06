@@ -902,8 +902,20 @@ async def _get_result_count(page: Page) -> int | None:
 
 
 async def _click_next_page(page: Page) -> bool:
-    """Click the Next pagination control. Returns True on success."""
+    """Click the Next pagination control. Returns True on success.
+
+    The results grid is a Kendo UI grid — its pager is icon-only with no
+    "Next" text (verified live 2026-08-06: `a.k-pager-nav[title="Go to the
+    next page"]`, `aria-disabled` true/false, no visible label). None of the
+    old generic selectors below ever matched it, so this always returned
+    False after page 1 — silently truncating any search whose results
+    didn't fit on one 25-row page (invisible for narrow daily/catch-up
+    windows, but a wide historical range can have 400+ matching rows / 15+
+    pages, all but the first silently dropped).
+    """
     next_selectors = [
+        "a.k-pager-nav[title='Go to the next page']",
+        "a[data-page][title='Go to the next page']",
         "a:has-text('Next')",
         "a[title='Next Page']",
         "input[value='Next']",
@@ -920,7 +932,10 @@ async def _click_next_page(page: Page) -> bool:
                 if disabled or aria_disabled == "true":
                     return False
                 await el.click()
-                await page.wait_for_load_state("networkidle", timeout=15_000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
                 await _delay()
                 return True
         except Exception:
