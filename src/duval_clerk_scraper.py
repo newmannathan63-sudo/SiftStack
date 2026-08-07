@@ -303,7 +303,7 @@ async def _fetch_lp_details(page: Page, instrument_cell) -> dict:
             return result
         pdf_url = iframe_src.replace("DocumentImage1", "DocumentPdfAllPages")
 
-        resp = await new_page.request.get(pdf_url)
+        resp = await new_page.request.get(pdf_url, timeout=20_000)
         if resp.status == 200:
             result["pdf_bytes"] = await resp.body()
         return result
@@ -870,7 +870,21 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
             # get a fair shot at the mortgage_confirmed override below.
             doc_fields: dict = {}
             if _plaintiff_is_mortgage_lender(plaintiff) and len(cells) > 3 + _offset:
-                doc_fields = await _fetch_and_ocr_lp_document(page, cells[3 + _offset])
+                # Hard ceiling on the whole fetch+OCR round-trip: individual
+                # awaits inside it are timed, but a hang in any one of them
+                # (e.g. a PDF download that stalls without erroring) would
+                # otherwise block this row — and every row after it — forever.
+                # Verified live 2026-08-06: a historical run hung for 2+ hours
+                # on exactly this with no further log output. Ground-truth
+                # data is best-effort; callers already fall back to the DCPA
+                # name-lookup tier when doc_fields is empty.
+                try:
+                    doc_fields = await asyncio.wait_for(
+                        _fetch_and_ocr_lp_document(page, cells[3 + _offset]), timeout=45
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("  LP document fetch+OCR timed out after 45s — skipping ground truth for this row")
+                    doc_fields = {}
                 if doc_fields:
                     doc_fetch_count += 1
 
