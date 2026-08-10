@@ -1251,6 +1251,8 @@ async def _scrape_duval_clerk_search(
             continue
 
         notice = _parse_lp_row(row_text, search, effective_date or today, i + 1)
+        if plaintiff:
+            notice.plaintiff = plaintiff
 
         # Ground-truth address/parcel from the actual recorded document (OCR)
         # takes priority over anything the index-row regex parser found.
