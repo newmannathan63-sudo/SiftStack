@@ -1140,6 +1140,7 @@ async def _scrape_duval_clerk_search(
 
     # ── Main range search (released records in [start, today]) ───────
     all_rows: list[tuple[str, str, dict]] = await _collect_rows_from_search(page, start, today)
+    main_row_count = len(all_rows)
 
     # Parse the released-through date so we can persist it and detect changes.
     released_through = await _parse_released_through_date(page)
@@ -1237,7 +1238,13 @@ async def _scrape_duval_clerk_search(
         batch_seen.add(nhash)
 
         effective_date = rec_date or start
-        if since_date and effective_date and effective_date < since_date:
+        # Catch-up rows (appended after the main-range fetch) are *expected*
+        # to predate since_date — that's the entire reason they weren't
+        # captured on a prior run. They're already deduped via seen_ids/
+        # batch_seen above, so the since_date floor only applies to rows
+        # from the main [start, today] search.
+        is_catchup = i >= main_row_count
+        if not is_catchup and since_date and effective_date and effective_date < since_date:
             logger.info(
                 "  Skipping old record: defendant=%s date=%s < since=%s", defendant[:30], effective_date, since_date
             )
