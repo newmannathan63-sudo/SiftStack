@@ -954,6 +954,7 @@ async def scrape_jdr_all(
     since_date: str | None = None,
     seen_ids: dict[str, str] | None = None,
     llm_api_key: str | None = None,
+    failures: list[str] | None = None,
 ) -> list[NoticeData]:
     """Scrape all JDR-sourced saved searches and return combined NoticeData.
 
@@ -997,10 +998,12 @@ async def scrape_jdr_all(
             try:
                 batch = await _scrape_jdr_search(page, search, since_date, seen_ids, llm_api_key)
                 all_notices.extend(batch)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "JDR scrape failed for %s/%s", search.county, search.notice_type
                 )
+                if failures is not None:
+                    failures.append(f"JDR {search.county}/{search.notice_type}: {exc}")
 
         await browser.close()
 

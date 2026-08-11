@@ -366,6 +366,12 @@ async def actor_main() -> None:
                 )
                 notices.extend(tnpn_notices)
 
+            # Collects per-search scrape exceptions (e.g. Playwright navigation
+            # crashes, connection resets) so a crashed search can be told apart
+            # from a search that genuinely found nothing new — both currently
+            # collapse to the same "0 notices" outcome downstream otherwise.
+            scrape_failures: list[str] = []
+
             if jdr_searches_actor:
                 from jdr_scraper import scrape_jdr_all
                 jdr_notices = await scrape_jdr_all(
@@ -373,6 +379,7 @@ async def actor_main() -> None:
                     since_date=since_date_override or None,
                     seen_ids=seen_ids,
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
+                    failures=scrape_failures,
                 )
                 await persist_seen_ids(seen_ids)
                 notices.extend(jdr_notices)
@@ -386,11 +393,25 @@ async def actor_main() -> None:
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
                     proxy_url=proxy_url,
                     last_released_through=last_released_through,
+                    failures=scrape_failures,
                 )
                 if dc_released_through:
                     last_released_through = dc_released_through
                 await persist_seen_ids(seen_ids)
                 notices.extend(dc_notices)
+
+            if scrape_failures and do_notify_slack and config.SLACK_WEBHOOK_URL:
+                try:
+                    from slack_notifier import notify_warning
+                    notify_warning(
+                        f"{len(scrape_failures)} saved search(es) crashed mid-scrape "
+                        "and contributed 0 notices — a low/zero count today may be "
+                        "an outage, not genuinely empty:\n"
+                        + "\n".join(f"  - {f}" for f in scrape_failures),
+                        context=f"run mode={mode}",
+                    )
+                except Exception as e:
+                    Actor.log.warning("Scrape-failure Slack notification failed: %s", e)
 
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]

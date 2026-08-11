@@ -1341,6 +1341,7 @@ async def scrape_duval_clerk_all(
     llm_api_key: str | None = None,
     proxy_url: str | None = None,
     last_released_through: str | None = None,
+    failures: list[str] | None = None,
 ) -> tuple[list[NoticeData], str | None]:
     """Scrape all duval_clerk saved searches and return (notices, released_through).
 
@@ -1409,10 +1410,12 @@ async def scrape_duval_clerk_all(
                 all_notices.extend(batch)
                 if rt:
                     current_released_through = rt
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "DuvalClerk scrape failed for %s/%s", search.county, search.notice_type
                 )
+                if failures is not None:
+                    failures.append(f"DuvalClerk {search.county}/{search.notice_type}: {exc}")
 
         await browser.close()
 
