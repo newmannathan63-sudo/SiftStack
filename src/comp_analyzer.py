@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 # ── API Configuration ─────────────────────────────────────────────────
 API_BASE = "https://api.openwebninja.com/realtime-zillow-data"
 PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
-COMPS_ENDPOINT = f"{API_BASE}/similar-sale-homes"
+# NOTE: there is no dedicated "similar sales" endpoint on this API — recently
+# sold comps come from the general /search endpoint filtered to home_status=
+# RECENTLY_SOLD (verified against OpenWeb Ninja's docs and live responses;
+# the previously-used similar-sale-homes path 404s unconditionally).
+COMPS_ENDPOINT = f"{API_BASE}/search"
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30
@@ -220,96 +224,118 @@ def fetch_subject_property(address: str, city: str = "", state: str = "TN",
     )
 
 
+def _parse_sold_date(item: dict) -> str:
+    """Extract a YYYY-MM-DD sold date from a /search RECENTLY_SOLD item.
+
+    dateSold comes back as epoch milliseconds; lastSoldDate (when present)
+    is already an ISO-ish string.
+    """
+    raw = item.get("lastSoldDate")
+    if raw:
+        return str(raw)[:10]
+    ms = item.get("dateSold")
+    if ms:
+        try:
+            return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+        except (ValueError, OSError, OverflowError):
+            return ""
+    return ""
+
+
+def _parse_comp_item(item: dict, subject: SubjectProperty) -> CompProperty | None:
+    """Build a CompProperty from one /search RECENTLY_SOLD result item."""
+    sold_price = float(item.get("price") or item.get("unformattedPrice") or item.get("lastSoldPrice") or 0)
+    sold_date = _parse_sold_date(item)
+
+    if not sold_price or sold_price < 10000:
+        return None
+
+    lat = float(item.get("latitude") or 0)
+    lon = float(item.get("longitude") or 0)
+
+    dist = 0.0
+    if subject.latitude and subject.longitude and lat and lon:
+        dist = _haversine_miles(subject.latitude, subject.longitude, lat, lon)
+
+    lot_sqft = 0
+    lot_val = item.get("lotAreaValue") or item.get("lotSize")
+    lot_units = (item.get("lotAreaUnit") or item.get("lotAreaUnits") or "").lower()
+    if lot_val:
+        try:
+            lot_sqft = int(float(lot_val) * 43560) if "acre" in lot_units else int(float(lot_val))
+        except (ValueError, TypeError):
+            pass
+
+    comp = CompProperty(
+        address=item.get("streetAddress") or item.get("address") or "",
+        city=item.get("city") or item.get("addressCity") or "",
+        state=item.get("state") or item.get("addressState") or subject.state,
+        zip_code=str(item.get("zipcode") or item.get("addressZipcode") or ""),
+        latitude=lat,
+        longitude=lon,
+        distance_miles=round(dist, 2),
+        sqft=int(item.get("livingArea") or item.get("area") or item.get("sqft") or 0),
+        bedrooms=int(item.get("bedrooms") or item.get("beds") or 0),
+        bathrooms=float(item.get("bathrooms") or item.get("baths") or 0),
+        year_built=int(item.get("yearBuilt") or 0),
+        lot_sqft=lot_sqft,
+        property_type=item.get("homeType") or item.get("propertyType") or "",
+        sold_price=sold_price,
+        sold_date=sold_date,
+        days_on_market=int(item.get("daysOnZillow") or 0),
+        garage_spaces=int(item.get("garageSpaces") or 0),
+    )
+    comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
+    return comp
+
+
 def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAULT_RADIUS_MILES,
                            months_back: int = DEFAULT_MONTHS_BACK,
                            api_key: str = "") -> list[CompProperty]:
-    """Fetch comparable sold properties near the subject property."""
+    """Fetch comparable sold properties near the subject property.
+
+    The API has no radius/date-scoped comps endpoint, so this pulls all
+    recently-sold listings in the subject's ZIP (or city/state) in one call
+    and applies distance + recency filtering locally, widening both up to
+    the configured maximums if too few comps survive.
+    """
     api_key = api_key or config.OPENWEBNINJA_API_KEY
     if not api_key:
         return []
 
-    full_address = f"{subject.address} {subject.city} {subject.state} {subject.zip_code}"
-    data = _api_get(COMPS_ENDPOINT, {"address": full_address}, api_key)
+    location = subject.zip_code or f"{subject.city}, {subject.state}".strip(", ")
+    data = _api_get(COMPS_ENDPOINT, {
+        "location": location,
+        "home_status": "RECENTLY_SOLD",
+        "sort": "NEWEST",
+    }, api_key)
 
     time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
-    comps = []
-    items = data if isinstance(data, list) else (data.get("comps") or data.get("results") or []) if data else []
+    items = data if isinstance(data, list) else []
+    all_comps = [c for c in (_parse_comp_item(item, subject) for item in items if not isinstance(item, str)) if c]
 
-    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    def _filter(radius: float, months: int) -> list[CompProperty]:
+        cutoff = (datetime.now() - timedelta(days=months * 30)).strftime("%Y-%m-%d")
+        return [
+            c for c in all_comps
+            if (c.distance_miles <= radius or not (subject.latitude and subject.longitude and c.latitude and c.longitude))
+            and (not c.sold_date or c.sold_date >= cutoff)
+        ]
 
-    for item in items:
-        if isinstance(item, str):
-            continue
-
-        # Parse sold info
-        sold_price = float(item.get("lastSoldPrice") or item.get("price") or 0)
-        sold_date = str(item.get("lastSoldDate") or item.get("dateSold") or "")[:10]
-
-        if not sold_price or sold_price < 10000:
-            continue
-
-        # Filter by date
-        if sold_date and sold_date < cutoff_date:
-            continue
-
-        lat = float(item.get("latitude") or 0)
-        lon = float(item.get("longitude") or 0)
-
-        # Filter by distance
-        dist = 0.0
-        if subject.latitude and subject.longitude and lat and lon:
-            dist = _haversine_miles(subject.latitude, subject.longitude, lat, lon)
-            if dist > radius_miles:
-                continue
-
-        lot_sqft = 0
-        lot_val = item.get("lotAreaValue") or item.get("lotSize")
-        lot_units = (item.get("lotAreaUnits") or "").lower()
-        if lot_val:
-            try:
-                lot_sqft = int(float(lot_val) * 43560) if "acre" in lot_units else int(float(lot_val))
-            except (ValueError, TypeError):
-                pass
-
-        comp = CompProperty(
-            address=item.get("streetAddress") or item.get("address") or "",
-            city=item.get("city") or "",
-            state=item.get("state") or "TN",
-            zip_code=str(item.get("zipcode") or item.get("zip") or ""),
-            latitude=lat,
-            longitude=lon,
-            distance_miles=round(dist, 2),
-            sqft=int(item.get("livingArea") or item.get("sqft") or 0),
-            bedrooms=int(item.get("bedrooms") or 0),
-            bathrooms=float(item.get("bathrooms") or 0),
-            year_built=int(item.get("yearBuilt") or 0),
-            lot_sqft=lot_sqft,
-            property_type=item.get("homeType") or item.get("propertyType") or "",
-            sold_price=sold_price,
-            sold_date=sold_date,
-            days_on_market=int(item.get("daysOnZillow") or 0),
-            garage_spaces=int(item.get("garageSpaces") or 0),
-        )
-        comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
-        comps.append(comp)
-
+    comps = _filter(radius_miles, months_back)
     logger.info("Fetched %d comparable sales within %.1f mi (last %d months)", len(comps), radius_miles, months_back)
 
-    # If we don't have enough comps, try expanding radius and time window
-    if len(comps) < MIN_COMPS and (radius_miles < MAX_RADIUS_MILES or months_back < MAX_MONTHS_BACK):
-        new_radius = min(radius_miles * 1.5, MAX_RADIUS_MILES)
-        new_months = min(months_back + 3, MAX_MONTHS_BACK)
-        if new_radius > radius_miles or new_months > months_back:
-            logger.info("Only %d comps — expanding search to %.1f mi / %d months",
-                        len(comps), new_radius, new_months)
-            # Re-filter with expanded params (comps already fetched, just relax filters)
-            expanded_cutoff = (datetime.now() - timedelta(days=new_months * 30)).strftime("%Y-%m-%d")
-            # Re-process original items with relaxed filters
-            # For now, the API returns what it returns — we just note the expansion
-            pass
+    # If we don't have enough comps, widen radius and time window against the same result set
+    radius, months = radius_miles, months_back
+    while len(comps) < MIN_COMPS and (radius < MAX_RADIUS_MILES or months < MAX_MONTHS_BACK):
+        radius = min(radius * 1.5, MAX_RADIUS_MILES)
+        months = min(months + 3, MAX_MONTHS_BACK)
+        comps = _filter(radius, months)
+        logger.info("Only %d comps — expanded search to %.1f mi / %d months", len(comps), radius, months)
 
-    return comps
+    comps.sort(key=lambda c: c.distance_miles)
+    return comps[:MAX_COMPS]
 
 
 # ── Similarity scoring ────────────────────────────────────────────────

@@ -20,13 +20,16 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Regional multipliers ──────────────────────────────────────────────
-# Knoxville labor/materials costs relative to national average (1.0)
+# Residential cost factors relative to national average (1.0), sourced from
+# RSMeans Location Factors - Residential (zip-code level: Knoxville 377-379,
+# Jacksonville 320/322).
 REGIONAL_MULTIPLIERS = {
-    "knoxville": 0.88,      # ~12% below national average
+    "knoxville": 0.82,
     "blount": 0.86,          # Slightly lower than Knox
     "national": 1.00,
     "nashville": 0.95,
     "chattanooga": 0.90,
+    "jacksonville": 0.81,
 }
 DEFAULT_REGION = "knoxville"
 

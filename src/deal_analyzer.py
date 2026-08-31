@@ -570,7 +570,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         ("Formula", "ARV × 70% - Rehab - Assignment Fee", ""),
         ("ARV × 70%", _fmt_money(pkg.arv.arv_mid * 0.70), ""),
         ("Less Rehab", f"- {_fmt_money(pkg.rehab_full.grand_total)}", ""),
-        ("Less Assignment", f"- {_fmt_money(DEFAULT_WHOLESALE_FEE)}", ""),
+        ("Less Assignment", f"- {_fmt_money(pkg.wholesale.assignment_fee)}", ""),
         ("MAO", _fmt_money(pkg.mao.wholesale_mao), ""),
     ]
     for i, (label, value, _) in enumerate(mao_data, 3):
