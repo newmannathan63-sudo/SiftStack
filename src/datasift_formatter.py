@@ -1,7 +1,7 @@
 """Format NoticeData records into DataSift.ai (REISift) upload-ready CSV.
 
 DataSift has 60+ built-in fields that auto-map when CSV headers match exactly.
-This module maps our enrichment data to those built-in fields, plus 23 custom
+This module maps our enrichment data to those built-in fields, plus custom
 fields in the "SiftStack" custom group for deep prospecting/notice-specific data.
 
 For deceased records, the contact (Owner First/Last + Mailing Address) is set
@@ -104,6 +104,8 @@ DATASIFT_COLUMNS = [
     "Entity Type",
     "Entity Contact",
     "Entity Contact Role",
+    # ── Auction filtering (SiftStack "Scheduled Auction" preset) ──
+    "Scheduled Auction Date",
 ]
 
 
@@ -783,6 +785,8 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Entity Type": notice.entity_type,
         "Entity Contact": notice.entity_person_name,
         "Entity Contact Role": notice.entity_person_role,
+        # ── Auction filtering ──
+        "Scheduled Auction Date": _format_date(notice.auction_date),
     }
 
 
