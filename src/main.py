@@ -167,6 +167,8 @@ async def actor_main() -> None:
             "SERPER_API_KEY": actor_input.get("serper_api_key", ""),
             "FIRECRAWL_API_KEY": actor_input.get("firecrawl_api_key", ""),
             "TRACERFY_API_KEY": actor_input.get("tracerfy_api_key", ""),
+            "SMARTSKIP_EMAIL": actor_input.get("smartskip_email", ""),
+            "SMARTSKIP_PASSWORD": actor_input.get("smartskip_password", ""),
             "DATASIFT_EMAIL": actor_input.get("datasift_email", ""),
             "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
             "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
@@ -187,10 +189,15 @@ async def actor_main() -> None:
 
         # Pipeline toggles
         do_tracerfy = actor_input.get("run_tracerfy", True)
+        do_smartskip = actor_input.get("run_smartskip", True)
         do_notify_slack = actor_input.get("notify_slack", True)
         do_ds_upload = actor_input.get("upload_datasift", True)
         do_enrich_ds = actor_input.get("enrich_datasift", True)
-        do_skip_trace_ds = actor_input.get("skip_trace_datasift", True)
+        # Off by default: DataSift's unlimited skip-trace add-on isn't currently
+        # active, so this auto-trigger would fail/no-op. Run Skip Trace manually
+        # in DataSift's UI instead, then run `phone-validate` locally for Trestle
+        # scoring — see project_datasift_skiptrace_billing_gap memory.
+        do_skip_trace_ds = actor_input.get("skip_trace_datasift", False)
         # Kill switch: overrides task input regardless of its saved settings.
         # Set DATASIFT_UPLOAD_DISABLED=true as an actor env var to pause all
         # DataSift upload/enrich/skip-trace until the record-selection bug
@@ -480,6 +487,35 @@ async def actor_main() -> None:
                     Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
             elif do_tracerfy:
                 Actor.log.info("Tracerfy skipped — no API key configured")
+
+            # ── SmartSkip Skip Trace (DP candidates only, for now) ──────────
+            # Mirrors Tracerfy's DP-only scope. Runs on every DP contact
+            # regardless of what Tracerfy already found — additive coverage,
+            # not gap-filling — merging new numbers/emails into empty slots.
+            smartskip_stats = None
+            if do_smartskip and config.SMARTSKIP_EMAIL and config.SMARTSKIP_PASSWORD:
+                dp_for_smartskip = [
+                    n for n in notices
+                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+                ]
+                if dp_for_smartskip:
+                    Actor.log.info("Running SmartSkip on %d DP candidates...",
+                                   len(dp_for_smartskip))
+                    try:
+                        from smartskip_skip_tracer import batch_skip_trace as smartskip_batch_skip_trace
+                        smartskip_stats = smartskip_batch_skip_trace(dp_for_smartskip)
+                        Actor.log.info(
+                            "SmartSkip: %d/%d matched, %d new phones, %d new emails, $%.2f",
+                            smartskip_stats["matched"], smartskip_stats["submitted"],
+                            smartskip_stats["phones_found"], smartskip_stats["emails_found"],
+                            smartskip_stats["cost"],
+                        )
+                    except Exception as e:
+                        Actor.log.warning("SmartSkip skip trace failed: %s — continuing", e)
+                else:
+                    Actor.log.info("No DP candidates — SmartSkip skipped")
+            elif do_smartskip:
+                Actor.log.info("SmartSkip skipped — no credentials configured")
 
             # ── Generate Deep Prospecting PDFs ────────────────────────
             # Only generate PDFs for records that have deep prospecting data:
@@ -867,6 +903,99 @@ def _run_photo_import(args) -> None:
     logging.info("Done — %d records exported", len(notices))
 
 
+def _run_trace_csv(args) -> None:
+    """Manually skip trace + Trestle-rank a CSV of records — no DataSift interaction.
+
+    For records the user is actively working today: load a Sift-formatted CSV,
+    run Tracerfy + SmartSkip to find phones/emails, score them with Trestle, and
+    write the results back out. Lets the user control skip-trace spend by hand
+    instead of tracing everything the daily pipeline scrapes.
+    """
+    import csv as _csv
+
+    from data_formatter import read_csv
+    from tracerfy_skip_tracer import PHONE_FIELDS
+    from tracerfy_skip_tracer import batch_skip_trace as tracerfy_batch_skip_trace
+
+    csv_path = getattr(args, "csv_path", None)
+    if not csv_path:
+        logging.error("--csv-path is required for trace-csv mode")
+        sys.exit(1)
+
+    path = Path(csv_path)
+    if not path.exists():
+        logging.error("CSV file not found: %s", path)
+        sys.exit(1)
+
+    notices = read_csv(path)
+    if not notices:
+        logging.warning("No records found in CSV")
+        sys.exit(0)
+    logging.info("Loaded %d records from %s", len(notices), path.name)
+
+    if not getattr(args, "skip_tracerfy", False) and config.TRACERFY_API_KEY:
+        tracerfy_stats = tracerfy_batch_skip_trace(notices)
+        logging.info(
+            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+            tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
+            tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
+            tracerfy_stats.get("cost", 0.0),
+        )
+    else:
+        logging.info("Tracerfy skipped (--skip-tracerfy or no API key)")
+
+    if not getattr(args, "skip_smartskip", False) and config.SMARTSKIP_EMAIL and config.SMARTSKIP_PASSWORD:
+        from smartskip_skip_tracer import batch_skip_trace as smartskip_batch_skip_trace
+        smartskip_stats = smartskip_batch_skip_trace(notices)
+        logging.info(
+            "SmartSkip: %d/%d matched, %d new phones, %d new emails, $%.2f",
+            smartskip_stats.get("matched", 0), smartskip_stats.get("submitted", 0),
+            smartskip_stats.get("phones_found", 0), smartskip_stats.get("emails_found", 0),
+            smartskip_stats.get("cost", 0.0),
+        )
+    else:
+        logging.info("SmartSkip skipped (--skip-smartskip or no credentials)")
+
+    phone_tiers: dict = {}
+    if config.TRESTLE_API_KEY:
+        from phone_validator import score_record_phones
+        phone_tiers = score_record_phones(
+            notices, config.TRESTLE_API_KEY,
+            add_litigator=getattr(args, "add_litigator", False),
+            batch_size=getattr(args, "batch_size", 10),
+        )
+        logging.info("Trestle scored %d unique phones across %d records",
+                     len(phone_tiers), len(notices))
+    else:
+        logging.warning("No Trestle API key configured — skipping ranking")
+
+    # Write the traced records back out (Sift-formatted, phones/emails filled in)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = write_csv(notices, filename=f"{path.stem}_traced_{timestamp}.csv")
+    logging.info("Output: %s", out_path)
+
+    # Write a phone-tier summary alongside it — owner/address/phone/tier/score,
+    # since NoticeData/the Sift CSV schema has no tier column of its own.
+    if phone_tiers:
+        tier_path = out_path.parent / f"{path.stem}_phone_tiers_{timestamp}.csv"
+        with open(tier_path, "w", newline="", encoding="utf-8") as f:
+            writer = _csv.writer(f)
+            writer.writerow(["owner_name", "address", "phone", "tier", "score", "line_type"])
+            for n in notices:
+                for field in PHONE_FIELDS:
+                    phone = (getattr(n, field, "") or "").strip()
+                    if not phone:
+                        continue
+                    info = phone_tiers.get(phone)
+                    if not info:
+                        continue
+                    writer.writerow([
+                        n.owner_name, n.address, phone,
+                        info.get("tier", ""), info.get("score", ""), info.get("line_type", ""),
+                    ])
+        logging.info("Phone tier summary: %s", tier_path)
+
+
 def _run_csv_import(args) -> None:
     """Run the CSV re-import pipeline: read CSV → enrich → write new CSV.
 
@@ -977,7 +1106,12 @@ def _run_csv_import(args) -> None:
         from datasift_uploader import upload_datasift_split, upload_to_datasift
 
         do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        # Off by default: DataSift's unlimited skip-trace add-on isn't currently
+        # active, so the auto-trigger would fail/no-op. Run Skip Trace manually in
+        # DataSift's UI instead, then run `phone-validate` for Trestle scoring —
+        # see project_datasift_skiptrace_billing_gap memory. Revert this once the
+        # add-on is reactivated.
+        do_skip_trace = False
 
         csv_infos = write_datasift_split_csvs(notices)
         for info in csv_infos:
@@ -1152,7 +1286,7 @@ def cli_main() -> None:
         "mode",
         choices=[
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
-            "csv-import", "phone-validate", "manage-sold", "manage-presets",
+            "csv-import", "trace-csv", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
@@ -1161,6 +1295,7 @@ def cli_main() -> None:
         help=(
             "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
+            "trace-csv = manually skip trace + Trestle-rank a CSV (Tracerfy + SmartSkip, no DataSift); "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
@@ -1358,6 +1493,11 @@ def cli_main() -> None:
         "--skip-tracerfy",
         action="store_true",
         help="Skip Tracerfy batch skip trace (phones + emails) before DataSift upload",
+    )
+    parser.add_argument(
+        "--skip-smartskip",
+        action="store_true",
+        help="Skip SmartSkip batch skip trace (phones + emails) before DataSift upload",
     )
     parser.add_argument(
         "--llm-backend",
@@ -1854,6 +1994,11 @@ def cli_main() -> None:
         _run_csv_import(args)
         return
 
+    # Manual trace-and-rank mode — separate pipeline, no DataSift interaction
+    if args.mode == "trace-csv":
+        _run_trace_csv(args)
+        return
+
     # Filter saved searches
     counties = None
     if args.counties and args.counties.lower() != "all":
@@ -2004,39 +2149,62 @@ def _run_scrape_pipeline(args, searches) -> None:
         sys.exit(0)
 
     # Tracerfy batch skip trace (phones + emails for all records)
+    import config as cfg
+
     tiers_map: dict = {}
     tracerfy_stats: dict = {}
-    if not getattr(args, "skip_tracerfy", False):
-        import config as cfg
-        if cfg.TRACERFY_API_KEY:
-            from tracerfy_skip_tracer import batch_skip_trace
-            tracerfy_stats = batch_skip_trace(notices)
-            if tracerfy_stats.get("credits_exhausted"):
-                logging.error(
-                    "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
-                    "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
-                )
-            logging.info(
-                "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
-                tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
-                tracerfy_stats.get("cost", 0.0),
+    if not getattr(args, "skip_tracerfy", False) and cfg.TRACERFY_API_KEY:
+        from tracerfy_skip_tracer import batch_skip_trace
+        tracerfy_stats = batch_skip_trace(notices)
+        if tracerfy_stats.get("credits_exhausted"):
+            logging.error(
+                "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
+                "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
             )
-            # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
-            # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
-            if cfg.TRESTLE_API_KEY:
-                from phone_validator import score_record_phones
-                dp_cands = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_cands:
-                    try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
-                        logging.info("Trestle scored %d unique phones across %d DP records",
-                                     len(tiers_map), len(dp_cands))
-                    except Exception as e:
-                        logging.warning("Per-record Trestle scoring failed: %s", e)
+        logging.info(
+            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+            tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
+            tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
+            tracerfy_stats.get("cost", 0.0),
+        )
+
+    # SmartSkip batch skip trace — independent of Tracerfy's flag. Runs on every
+    # contact regardless of what Tracerfy found, adding any new numbers/emails
+    # into empty slots (additive, not gap-filling-only). Dashboard-only service,
+    # no API — Playwright-based.
+    smartskip_stats: dict = {}
+    if not getattr(args, "skip_smartskip", False) and cfg.SMARTSKIP_EMAIL and cfg.SMARTSKIP_PASSWORD:
+        from smartskip_skip_tracer import batch_skip_trace as smartskip_batch_skip_trace
+        smartskip_stats = smartskip_batch_skip_trace(notices)
+        if smartskip_stats.get("credits_exhausted"):
+            logging.error(
+                "SMARTSKIP OUT OF CREDITS — skip trace disabled for this run. "
+                "Add credits at https://smartskip.io/billing to resume phone/email lookups."
+            )
+        logging.info(
+            "SmartSkip: %d/%d matched, %d new phones, %d new emails, $%.2f",
+            smartskip_stats.get("matched", 0), smartskip_stats.get("submitted", 0),
+            smartskip_stats.get("phones_found", 0), smartskip_stats.get("emails_found", 0),
+            smartskip_stats.get("cost", 0.0),
+        )
+
+    # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
+    # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
+    # Runs after both tracers so PDF previews reflect whatever combination of
+    # Tracerfy/SmartSkip data landed on the notices.
+    if cfg.TRESTLE_API_KEY:
+        from phone_validator import score_record_phones
+        dp_cands = [
+            n for n in notices
+            if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+        ]
+        if dp_cands:
+            try:
+                tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
+                logging.info("Trestle scored %d unique phones across %d DP records",
+                             len(tiers_map), len(dp_cands))
+            except Exception as e:
+                logging.warning("Per-record Trestle scoring failed: %s", e)
 
     # Write output
     if args.split:
@@ -2087,7 +2255,12 @@ def _run_scrape_pipeline(args, searches) -> None:
         from datasift_uploader import upload_to_datasift, upload_datasift_split
 
         do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        # Off by default: DataSift's unlimited skip-trace add-on isn't currently
+        # active, so the auto-trigger would fail/no-op. Run Skip Trace manually in
+        # DataSift's UI instead, then run `phone-validate` for Trestle scoring —
+        # see project_datasift_skiptrace_billing_gap memory. Revert this once the
+        # add-on is reactivated.
+        do_skip_trace = False
 
         # Use split flow (separate DM + Heir Map Message Board entries)
         csv_infos = write_datasift_split_csvs(notices)

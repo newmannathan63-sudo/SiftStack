@@ -134,6 +134,20 @@
             "editor": "textfield",
             "isSecret": true
         },
+        "smartskip_email": {
+            "title": "SmartSkip Email",
+            "type": "string",
+            "description": "Login email for smartskip.io. SmartSkip has no public API, so this runs via browser automation against their dashboard. Optional.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "smartskip_password": {
+            "title": "SmartSkip Password",
+            "type": "string",
+            "description": "Login password for smartskip.io. Optional.",
+            "editor": "textfield",
+            "isSecret": true
+        },
         "trestle_api_key": {
             "title": "Trestle API Key",
             "type": "string",
@@ -179,14 +193,21 @@
         "skip_trace_datasift": {
             "title": "Skip Trace in DataSift",
             "type": "boolean",
-            "description": "Run DataSift's built-in Skip Trace after upload. Pulls phone numbers and emails via unlimited plan.",
-            "default": true,
+            "description": "Run DataSift's built-in Skip Trace after upload. Requires an active unlimited skip-trace add-on. Off by default until that add-on is reactivated — run Skip Trace manually in DataSift's UI instead, then run `phone-validate` locally for Trestle scoring.",
+            "default": false,
             "editor": "checkbox"
         },
         "run_tracerfy": {
             "title": "Run Tracerfy Skip Trace",
             "type": "boolean",
             "description": "Run Tracerfy batch skip trace before DataSift upload. Populates phone/email fields in the CSV. Requires tracerfy_api_key.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "run_smartskip": {
+            "title": "Run SmartSkip Skip Trace",
+            "type": "boolean",
+            "description": "Run SmartSkip batch skip trace before DataSift upload, right after Tracerfy. Adds any phones/emails Tracerfy didn't find, into empty fields, without overwriting Tracerfy's results. Requires smartskip_email and smartskip_password.",
             "default": true,
             "editor": "checkbox"
         },
