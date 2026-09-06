@@ -16,7 +16,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from config import OUTPUT_DIR
+from config import ESTATE_OF_RE, OUTPUT_DIR
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -160,6 +160,15 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     # Entity names → empty (don't put business names in person fields)
     if _is_entity_name(name):
         return ("", "")
+
+    # "Estate of X" (deceased-owner fallback contact) — split off "Estate" as
+    # the first name and keep the decedent's full name intact as the last
+    # name. Without this, the generic word-split below strips "of" into the
+    # last name ("Estate", "of Moore Wanda"), which DataSift's CSV import
+    # silently drops the row for — verified live 2026-09-01.
+    estate_match = ESTATE_OF_RE.match(name)
+    if estate_match:
+        return ("Estate", estate_match.group(1).strip())
 
     # Split joint owners on " & " or " AND " — keep first person only
     # "John & Jane Smith" → "John Smith"
