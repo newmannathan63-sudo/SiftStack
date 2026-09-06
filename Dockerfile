@@ -16,7 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # patchright ships its own patched Chrome build, separate from the base image's
 # bundled Playwright Chromium — used only by jdr_scraper.py to get past
 # Cloudflare's CDP-level automation detection on legals.jaxdailyrecord.com.
+# The base image's browser cache dir (PLAYWRIGHT_BROWSERS_PATH=/pw-browsers) is
+# root-owned; myuser can execute the browsers already installed there at
+# runtime but can't install a new one into it — switch to root for this step.
+USER root
 RUN python -m patchright install chromium
+USER myuser
 
 # Copy source code
 COPY src/ ./src/
