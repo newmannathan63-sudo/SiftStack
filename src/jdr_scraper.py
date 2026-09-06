@@ -9,10 +9,23 @@ Notice format differs from tnpublicnotice.com:
   - Probate uses "IN RE: ESTATE OF [NAME]" + Personal Representative contact block
   - Tax deeds reference parcel IDs and certificate numbers
 
-Selector notes (verified against live site 2026-06-07):
-  The JDR site uses standard HTML form elements. If a selector stops matching after
-  a site update, enable --verbose and check the "selector not found" warnings in the
-  log — they will identify exactly which field needs updating.
+Selector notes (verified against live site 2026-06-07, re-verified 2026-09-06):
+  The JDR site uses standard HTML form elements and these selectors are correct.
+  If every selector starts failing at once from the Apify actor while a local run
+  against the same URL works fine, it's not a selector problem — see the Cloudflare
+  note below. Only suspect selectors if a local Playwright run also fails to find them.
+
+Cloudflare note (added 2026-09-06): the site sits behind Cloudflare. Every Apify
+cloud run from 2026-08-16 onward silently got 0 notices — the page hung on
+networkidle, then fell back to a DOM with no search form. Root cause: Cloudflare
+serves a "Just a moment..." JS challenge (no form at all) to headless Playwright
+traffic from Apify. Fixed by combining two things — neither alone was confirmed
+sufficient, both are load-bearing:
+  1. Route through Apify's residential proxy (proxy_url param below).
+  2. JDR_STEALTH_LAUNCH_ARGS + JDR_STEALTH_INIT_SCRIPT, which patch the
+     navigator.webdriver / automation fingerprint that Cloudflare also checks.
+A plain unproxied run, and a proxied run without the stealth patches, both still
+got challenged — confirmed by direct testing against the live site.
 """
 
 import asyncio
@@ -39,6 +52,19 @@ JDR_CATEGORY_MAP: dict[str, str] = {
     "probate":     "Probate",
     "tax_sale":    "Tax Deeds",
 }
+
+# JDR sits behind Cloudflare, which serves a "Just a moment..." JS challenge page
+# (no search form at all) to plain headless Playwright — confirmed 2026-09-06 by
+# comparing a raw headless launch (challenged) against one with these two patches
+# applied (passed cleanly, both through the same residential proxy exit). Neither
+# patch alone was tested in isolation — keep both.
+JDR_STEALTH_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+JDR_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+"""
 
 # JDR's search_date field filters on an internal entry date that lags behind
 # when a notice actually becomes visible/searchable — records can appear in a
@@ -955,6 +981,7 @@ async def scrape_jdr_all(
     seen_ids: dict[str, str] | None = None,
     llm_api_key: str | None = None,
     failures: list[str] | None = None,
+    proxy_url: str | None = None,
 ) -> list[NoticeData]:
     """Scrape all JDR-sourced saved searches and return combined NoticeData.
 
@@ -963,6 +990,11 @@ async def scrape_jdr_all(
         since_date:  ISO date string (YYYY-MM-DD); only notices on/after this date.
         seen_ids:    Cross-run dedup dict {notice_hash: date}; updated in-place.
         llm_api_key: Anthropic API key for LLM fallback on missing fields.
+        proxy_url:   Optional proxy URL (e.g. Apify residential proxy). JDR sits
+                     behind Cloudflare, which throttles/degrades responses to
+                     datacenter IPs (confirmed 2026-09: every field selector fails
+                     when loaded from Apify's cloud IP, all pass from a residential
+                     IP) — route through a residential proxy to match.
 
     Returns:
         List of NoticeData for Duval County, FL with state="FL".
@@ -982,8 +1014,22 @@ async def scrape_jdr_all(
 
     all_notices: list[NoticeData] = []
 
+    launch_opts: dict = {"headless": True, "args": JDR_STEALTH_LAUNCH_ARGS}
+    if proxy_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        proxy_cfg: dict = {
+            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+        }
+        if parsed.username:
+            proxy_cfg["username"] = parsed.username
+        if parsed.password:
+            proxy_cfg["password"] = parsed.password
+        launch_opts["proxy"] = proxy_cfg
+        logger.info("JDR: using proxy %s:%s", parsed.hostname, parsed.port)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -991,6 +1037,7 @@ async def scrape_jdr_all(
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
+        await context.add_init_script(JDR_STEALTH_INIT_SCRIPT)
         context.set_default_timeout(30_000)
         page = await context.new_page()
 

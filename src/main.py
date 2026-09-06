@@ -401,6 +401,7 @@ async def actor_main() -> None:
                     seen_ids=seen_ids,
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
                     failures=scrape_failures,
+                    proxy_url=proxy_url,
                 )
                 notices.extend(jdr_notices)
 
