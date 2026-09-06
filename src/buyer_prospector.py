@@ -41,6 +41,43 @@ FLIP_MAX_HOLD_DAYS = 540     # 18 months
 MIN_TRANSACTIONS = 2         # Minimum to be considered an investor
 LOOKBACK_MONTHS = 18         # Default lookback period
 
+# ── Exclusion lists ────────────────────────────────────────────────────
+# Government agencies, courts, and public bodies that show up as "owner"
+# on tax deeds, foreclosures, and forfeiture records but are not buyers.
+GOVERNMENT_KEYWORDS = [
+    "CITY OF", "COUNTY OF", "STATE OF", "COUNTY COMMISSION",
+    "CLERK OF", "SHERIFF", "TAX COLLECTOR", "PROPERTY APPRAISER",
+    "BOARD OF COUNTY", "BOARD OF EDUCATION", "SCHOOL BOARD", "SCHOOL DISTRICT",
+    "DEPARTMENT OF", "DEPT OF", "SECRETARY OF", "DIVISION OF",
+    "UNITED STATES", "U.S. ", "USA", "IRS", "INTERNAL REVENUE",
+    "HUD", "HOUSING AND URBAN", "VETERANS AFFAIRS", "DEPT OF VETERANS",
+    "FANNIE MAE", "FEDERAL NATIONAL MORTGAGE", "FREDDIE MAC",
+    "FEDERAL HOME LOAN", "FDIC", "SBA ", "SMALL BUSINESS ADMIN",
+    "FLORIDA HOUSING FINANCE", "HOUSING AUTHORITY", "HOUSING FINANCE",
+    "JACKSONVILLE HOUSING", "JEA ", "DUVAL COUNTY", "CITY OF JACKSONVILLE",
+    "CONSOLIDATED GOVERNMENT", "REDEVELOPMENT AGENCY", "LAND BANK",
+    "COURT ADMINISTRATOR", "CLERK OF COURTS", "REGISTER OF DEEDS",
+]
+
+# Institutional iBuyers / large corporate SFR landlords — not the local
+# cash-buyer audience this list is built for.
+IBUYER_KEYWORDS = [
+    "OPENDOOR", "OFFERPAD", "ZILLOW", "REDFIN", "ORCHARD",
+    "HOMEVESTORS", "HOMEWARD", "KNOCK ", "FLYHOMES",
+    "INVITATION HOMES", "AMERICAN HOMES 4 RENT", "AMH ", "PROGRESS RESIDENTIAL",
+    "TRICON RESIDENTIAL", "FIRSTKEY HOMES", "VINEBROOK HOMES",
+    "MAIN STREET RENEWAL", "CERBERUS", "BLACKSTONE", "PRETIUM PARTNERS",
+    "STARWOOD", "CONREX", "SFR3", "HOME PARTNERS OF AMERICA",
+    "DIVVY HOMES", "RAVENHOUSE",
+]
+
+
+def _is_excluded_owner(name: str) -> bool:
+    """True if a name is a government agency or institutional iBuyer, not a real cash buyer."""
+    upper = name.upper()
+    return any(kw in upper for kw in GOVERNMENT_KEYWORDS) or \
+           any(kw in upper for kw in IBUYER_KEYWORDS)
+
 # ── Scoring weights ───────────────────────────────────────────────────
 WEIGHT_RECENCY = 0.30         # More recent activity = better
 WEIGHT_FREQUENCY = 0.25       # More transactions = better
@@ -62,6 +99,7 @@ class InvestorProfile:
     avg_hold_days: float = 0.0
     zip_codes: list = field(default_factory=list)
     primary_zip: str = ""
+    primary_state: str = ""
     property_types: list = field(default_factory=list)
     first_transaction: str = ""
     last_transaction: str = ""
@@ -89,8 +127,17 @@ class BuyerReport:
 
 def _load_transaction_data(counties: list[str] | None = None,
                            months_back: int = LOOKBACK_MONTHS) -> list[dict]:
-    """Load transaction data from our enriched CSV files."""
+    """Load transaction data from our enriched CSV files.
+
+    output/ retains one CSV per daily pipeline run rather than a single
+    deduplicated master, so the same underlying notice is re-exported on
+    many different days. Without deduping, a single record counted once
+    per snapshot file looks like repeat "transactions" for its owner. We
+    dedupe on (owner, address, notice_type) so each real-world record is
+    only counted once regardless of how many snapshot files it appears in.
+    """
     records = []
+    seen = set()
     cutoff = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
 
     for csv_path in config.OUTPUT_DIR.glob("*.csv"):
@@ -106,11 +153,20 @@ def _load_transaction_data(counties: list[str] | None = None,
                     if date_added and date_added < cutoff:
                         continue
 
+                    owner = (row.get("owner_name") or row.get("Owner Name") or
+                             row.get("full_name") or "").strip().upper()
+                    address = (row.get("address") or "").strip().upper()
+                    notice_type = (row.get("notice_type") or "").strip().lower()
+                    dedup_key = (owner, address, notice_type)
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+
                     records.append(row)
         except Exception as e:
             logger.debug("Error reading %s: %s", csv_path, e)
 
-    logger.info("Loaded %d records for buyer analysis", len(records))
+    logger.info("Loaded %d unique records for buyer analysis", len(records))
     return records
 
 
@@ -126,9 +182,15 @@ def _identify_investors(records: list[dict],
     # Group by owner name
     owner_records = defaultdict(list)
     for row in records:
+        # Probate "owner" is the decedent named in the filing, not a buyer.
+        if (row.get("notice_type") or "").strip().lower() == "probate":
+            continue
+
         owner = (row.get("owner_name") or row.get("Owner Name") or
                  row.get("full_name") or "").strip()
         if not owner or len(owner) < 3:
+            continue
+        if _is_excluded_owner(owner):
             continue
         owner_records[owner.upper()].append(row)
 
@@ -148,6 +210,7 @@ def _identify_investors(records: list[dict],
         zips = []
         types = []
         dates = []
+        states = []
 
         for r in recs:
             price = r.get("mls_last_sold_price") or r.get("estimated_value") or ""
@@ -160,6 +223,10 @@ def _identify_investors(records: list[dict],
             z = (r.get("zip") or "")[:5]
             if z:
                 zips.append(z)
+
+            st = (r.get("state") or r.get("Owner State") or "").strip()
+            if st:
+                states.append(st.upper())
 
             pt = r.get("property_type") or ""
             if pt:
@@ -184,6 +251,8 @@ def _identify_investors(records: list[dict],
 
         zip_counter = Counter(zips)
         primary_zip = zip_counter.most_common(1)[0][0] if zip_counter else ""
+        state_counter = Counter(states)
+        primary_state = state_counter.most_common(1)[0][0] if state_counter else ""
 
         profile = InvestorProfile(
             name=name.title(),
@@ -194,6 +263,7 @@ def _identify_investors(records: list[dict],
             total_invested=round(sum(prices)),
             zip_codes=list(set(zips)),
             primary_zip=primary_zip,
+            primary_state=primary_state,
             property_types=list(set(types)),
             first_transaction=min(dates) if dates else "",
             last_transaction=max(dates) if dates else "",
@@ -383,7 +453,7 @@ def export_buyers_csv(investors: list[InvestorProfile], output_path: str = "") -
                 "owner_name": inv.person_behind or inv.name,
                 "address": "",
                 "city": "",
-                "state": "TN",
+                "state": inv.primary_state or "TN",
                 "zip": inv.primary_zip,
                 "tags": f"buyer,{inv.buyer_type},buyer_score_{round(inv.score)}",
                 "lists": "Cash Buyers",
