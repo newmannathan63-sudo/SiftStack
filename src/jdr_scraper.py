@@ -21,19 +21,27 @@ networkidle, then fell back to a DOM with no search form. Root cause: Cloudflare
 serves a "Just a moment..." JS challenge (no form at all) to headless Playwright
 traffic from Apify.
 
-First fix attempt (residential proxy + a hand-rolled navigator.webdriver patch)
-passed when tested locally on Windows, but still got challenged when actually run
-in the Apify container — the container is headless Linux Chromium under xvfb-run
-(software/SwiftShader rendering, Linux navigator.platform), a much stronger
-fingerprint than the hand-rolled patch covered. Confirmed via a real backfill run
-on build 1.0.43: proxy was active, selectors still all failed identically.
+Three fix attempts so far, in order, each ruled out by a real Apify cloud run
+(never trust a local-only pass here — see below):
+  1. Residential proxy + a hand-rolled navigator.webdriver patch. Passed locally
+     on Windows, still 0 records / all selectors failing on build 1.0.43.
+  2. Added playwright-stealth (WebGL vendor/renderer + navigator.platform
+     overrides, more complete than the hand-rolled patch) and fixed a submit-
+     button click that was silently falling back to an unreliable Enter-key
+     press. Still 0 records / identical failure on build 1.0.44.
+  3. Current: switched the driver itself to `patchright` (see the import above)
+     with headless=False. Both prior attempts only spoofed JS-readable
+     properties; Cloudflare here is evidently also fingerprinting the CDP
+     automation protocol underneath, which no JS-level patch can hide — that's
+     what patchright's patches target. headless=False is required for
+     patchright's patches to apply; the container already wraps every run in
+     xvfb-run, so a real (headed) browser renders into that virtual display
+     with no visible-window requirement.
 
-Current fix: `playwright-stealth` (apply_stealth_async, see below), which also
-overrides WebGL vendor/renderer and navigator.platform — the signals a Linux
-headless build exposes that the minimal JS patch didn't touch. Keep the residential
-proxy too; that was the other half of the original diagnosis. If this stops working
-again, retest with a real Apify cloud run — a local Windows Playwright pass is not
-sufficient evidence, since that's exactly what looked fixed last time and wasn't.
+If this ALSO fails in a real cloud run, don't try a fourth local-only patch —
+the remaining honest options are a paid Cloudflare-unlocking proxy/API service
+(this is their actual product) or accepting the gap and looking for an
+alternate source for Duval foreclosure data.
 """
 
 import asyncio
@@ -43,7 +51,12 @@ import random
 import re
 from datetime import datetime, timedelta
 
-from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
+# patchright, not playwright: standard Playwright is detectable at the CDP/
+# automation-protocol level (not just via spoofable JS properties like
+# navigator.webdriver), which is what was actually blocking JDR — see the
+# Cloudflare note above. patchright is a maintained Playwright fork with those
+# protocol-level tells patched. Its API mirrors playwright.async_api directly.
+from patchright.async_api import Page, TimeoutError as PwTimeout, async_playwright
 from playwright_stealth import Stealth
 
 import config
@@ -1024,7 +1037,12 @@ async def scrape_jdr_all(
 
     all_notices: list[NoticeData] = []
 
-    launch_opts: dict = {"headless": True, "args": JDR_STEALTH_LAUNCH_ARGS}
+    # headless=False: patchright's anti-detection patches only take effect in a
+    # real (headed) browser — true headless mode is itself one of the signals
+    # Cloudflare's bot management checks for, below the JS layer. The container
+    # already runs everything under xvfb-run, so this renders into that virtual
+    # display rather than needing an actual visible window.
+    launch_opts: dict = {"headless": False, "args": JDR_STEALTH_LAUNCH_ARGS}
     if proxy_url:
         from urllib.parse import urlparse
         parsed = urlparse(proxy_url)

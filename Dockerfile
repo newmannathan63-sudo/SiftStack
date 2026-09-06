@@ -13,6 +13,11 @@ USER myuser
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# patchright ships its own patched Chrome build, separate from the base image's
+# bundled Playwright Chromium — used only by jdr_scraper.py to get past
+# Cloudflare's CDP-level automation detection on legals.jaxdailyrecord.com.
+RUN python -m patchright install chromium
+
 # Copy source code
 COPY src/ ./src/
 COPY .actor/ ./.actor/
