@@ -19,13 +19,21 @@ Cloudflare note (added 2026-09-06): the site sits behind Cloudflare. Every Apify
 cloud run from 2026-08-16 onward silently got 0 notices — the page hung on
 networkidle, then fell back to a DOM with no search form. Root cause: Cloudflare
 serves a "Just a moment..." JS challenge (no form at all) to headless Playwright
-traffic from Apify. Fixed by combining two things — neither alone was confirmed
-sufficient, both are load-bearing:
-  1. Route through Apify's residential proxy (proxy_url param below).
-  2. JDR_STEALTH_LAUNCH_ARGS + JDR_STEALTH_INIT_SCRIPT, which patch the
-     navigator.webdriver / automation fingerprint that Cloudflare also checks.
-A plain unproxied run, and a proxied run without the stealth patches, both still
-got challenged — confirmed by direct testing against the live site.
+traffic from Apify.
+
+First fix attempt (residential proxy + a hand-rolled navigator.webdriver patch)
+passed when tested locally on Windows, but still got challenged when actually run
+in the Apify container — the container is headless Linux Chromium under xvfb-run
+(software/SwiftShader rendering, Linux navigator.platform), a much stronger
+fingerprint than the hand-rolled patch covered. Confirmed via a real backfill run
+on build 1.0.43: proxy was active, selectors still all failed identically.
+
+Current fix: `playwright-stealth` (apply_stealth_async, see below), which also
+overrides WebGL vendor/renderer and navigator.platform — the signals a Linux
+headless build exposes that the minimal JS patch didn't touch. Keep the residential
+proxy too; that was the other half of the original diagnosis. If this stops working
+again, retest with a real Apify cloud run — a local Windows Playwright pass is not
+sufficient evidence, since that's exactly what looked fixed last time and wasn't.
 """
 
 import asyncio
@@ -36,6 +44,7 @@ import re
 from datetime import datetime, timedelta
 
 from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
+from playwright_stealth import Stealth
 
 import config
 from config import JDR_SEARCH_URL, REQUEST_DELAY_MAX, REQUEST_DELAY_MIN, SavedSearch
@@ -54,17 +63,12 @@ JDR_CATEGORY_MAP: dict[str, str] = {
 }
 
 # JDR sits behind Cloudflare, which serves a "Just a moment..." JS challenge page
-# (no search form at all) to plain headless Playwright — confirmed 2026-09-06 by
-# comparing a raw headless launch (challenged) against one with these two patches
-# applied (passed cleanly, both through the same residential proxy exit). Neither
-# patch alone was tested in isolation — keep both.
+# (no search form at all) to headless Playwright from the Apify container's Linux/
+# SwiftShader fingerprint — see the module docstring for what was tried and ruled
+# out. A hand-rolled webdriver-only patch was not enough in that container;
+# playwright-stealth also overrides WebGL vendor/renderer and navigator.platform,
+# the signals a Linux headless build actually exposes.
 JDR_STEALTH_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
-JDR_STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-window.chrome = { runtime: {} };
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-"""
 
 # JDR's search_date field filters on an internal entry date that lags behind
 # when a notice actually becomes visible/searchable — records can appear in a
@@ -654,7 +658,13 @@ async def _submit_search_form(
         el = await page.query_selector(sel)
         if el:
             try:
-                await page.click(sel, timeout=5_000)
+                # force=True: right after a Cloudflare clearance redirect the page can
+                # still be settling (a stale overlay node, a reflow in progress) which
+                # fails Playwright's normal actionability check even though the button
+                # is the right one and genuinely clickable — bypass that check rather
+                # than falling through to the Enter-key fallback, which submits
+                # whichever form last had focus (not reliably this one).
+                await page.click(sel, timeout=10_000, force=True)
                 submitted = True
                 logger.debug("Form submitted via %s", sel)
                 break
@@ -1037,7 +1047,7 @@ async def scrape_jdr_all(
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
-        await context.add_init_script(JDR_STEALTH_INIT_SCRIPT)
+        await Stealth().apply_stealth_async(context)
         context.set_default_timeout(30_000)
         page = await context.new_page()
 
