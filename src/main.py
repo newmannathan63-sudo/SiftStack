@@ -343,7 +343,21 @@ async def actor_main() -> None:
                 Actor.log.info("Loaded last_released_through_date = %s from KVS", last_released_through)
 
             async def persist_seen_ids(ids: dict) -> None:
-                """Mid-run persistence — if a later search crashes, progress is kept."""
+                """Mid-run persistence for the TNPN scrape_all callback only.
+
+                Do NOT call this after JDR/Duval Clerk scraping — marking notices
+                "seen" before they've actually been enriched and delivered (CSV/
+                DataSift/Slack) means a mid-pipeline kill (e.g. an Apify platform
+                migration SIGKILL, confirmed 2026-09-03/09-04) silently and
+                permanently drops real records: the restarted run reloads this
+                "seen" state from KVS and skips re-scraping them, even though
+                they were never uploaded anywhere. seen_notice_ids is committed
+                exactly once, at the end of a fully successful run (see the
+                "Save state to Apify KVS for next run" block below) — TNPN's
+                per-search callback is the sole intentional exception, since a
+                single TNPN run can span many slow, CAPTCHA-gated searches where
+                losing all mid-run progress on a later crash is the worse trade.
+                """
                 try:
                     await kvs.set_value("seen_notice_ids", ids)
                     await kvs.set_value(
@@ -388,7 +402,6 @@ async def actor_main() -> None:
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
                     failures=scrape_failures,
                 )
-                await persist_seen_ids(seen_ids)
                 notices.extend(jdr_notices)
 
             if duval_clerk_searches_actor:
@@ -404,7 +417,6 @@ async def actor_main() -> None:
                 )
                 if dc_released_through:
                     last_released_through = dc_released_through
-                await persist_seen_ids(seen_ids)
                 notices.extend(dc_notices)
 
             if scrape_failures and do_notify_slack and config.SLACK_WEBHOOK_URL:
