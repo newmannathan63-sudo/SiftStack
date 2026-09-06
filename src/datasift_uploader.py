@@ -753,7 +753,7 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
-async def _select_all_records(page: Page, retries: int = 9) -> bool:
+async def _select_all_records(page: Page, retries: int = 18) -> bool:
     """Select all records on the current page. Returns True if selected.
 
     Retries a few times with a wait in between: right after an upload,
@@ -764,9 +764,18 @@ async def _select_all_records(page: Page, retries: int = 9) -> bool:
     Widened again (2026-08-06) after an audit found this step failing on
     every run since ~7/28 with 0 checkboxes on the page — the fallback JS
     click found nothing because the list still had 0 indexed rows at the
-    old 60s (4x15s) budget's end. 9x20s (~3 min) matches observed indexing
-    latency; a live 191-record list select-all worked instantly, confirming
-    the header-dropdown selector itself is not the bug.
+    old 60s (4x15s) budget's end. 9x20s (~3 min) matched observed indexing
+    latency at the time; a live 191-record list select-all worked instantly,
+    confirming the header-dropdown selector itself is not the bug.
+
+    Widened again (2026-09-02) after Aug 30/31 and Sep 1 all failed this
+    step with 9x20s exhausted ("No records visible yet" on every retry) —
+    live-verified same day that the header dropdown still works instantly
+    against the account's current (larger) FTM list once it has settled,
+    ruling out a selector break again. The indexing window itself has
+    apparently grown past 3 minutes as the account has grown, so the fix is
+    a wider budget, not different selectors. 18x20s (~6 min) doubles the
+    prior budget; re-tighten if this still isn't enough.
     """
     for attempt in range(retries + 1):
         if attempt > 0:
