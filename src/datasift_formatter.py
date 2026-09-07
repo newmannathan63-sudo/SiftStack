@@ -106,6 +106,8 @@ DATASIFT_COLUMNS = [
     "Entity Contact Role",
     # ── Auction filtering (SiftStack "Scheduled Auction" preset) ──
     "Scheduled Auction Date",
+    # ── Lis pendens week-sorting (SiftStack "Recorded Lis Pendens Date" field) ──
+    "Recorded Lis Pendens Date",
 ]
 
 
@@ -714,6 +716,13 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     if notice.notice_type == "probate" and notice.decision_maker_name:
         personal_rep = notice.decision_maker_name
 
+    # Recorded Lis Pendens date — lis pendens/pre-foreclosure only, not
+    # foreclosure/auction records. date_added holds the LP recording date
+    # for these records (see duval_clerk_scraper.py).
+    recorded_lis_pendens = ""
+    if notice.notice_type == "lis_pendens":
+        recorded_lis_pendens = _format_date(notice.date_added)
+
     return {
         # ── Core auto-mapped ──
         "Property Street Address": notice.address,
@@ -796,6 +805,8 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Entity Contact Role": notice.entity_person_role,
         # ── Auction filtering ──
         "Scheduled Auction Date": _format_date(notice.auction_date),
+        # ── Lis pendens week-sorting ──
+        "Recorded Lis Pendens Date": recorded_lis_pendens,
     }
 
 
