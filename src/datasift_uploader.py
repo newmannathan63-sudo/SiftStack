@@ -632,9 +632,22 @@ DATASIFT_RECORDS_URL = "https://app.reisift.io/records/properties"
 
 
 async def _navigate_to_records(page: Page) -> None:
-    """Navigate to the Records page and wait for SPA to render."""
-    if "/records" not in page.url:
-        await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    """Navigate to the Records page and wait for SPA to render.
+
+    Always does a real navigation, even if page.url already says "/records" —
+    that's exactly the state the upload wizard's own client-side redirect
+    leaves the page in after a CSV upload, and reusing that page verbatim
+    (skipping the goto) is the likely cause of the "Header dropdown not
+    found — 0 checkboxes" enrichment failures that widening the select-all
+    retry budget twice (2026-08-06, 2026-09-02) didn't fix: a live
+    reproduction (2026-09-07) confirmed _select_all_records_once() works
+    instantly and correctly against a genuinely fresh /records navigation
+    with data already present — so those failures were never actually about
+    indexing latency. A fresh goto forces a clean SPA remount, clearing
+    whatever wizard-modal component state the client-side redirect carried
+    over, rather than trusting the URL alone to mean "already in a good state."
+    """
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(5000)
     await _dismiss_popups(page)
 
