@@ -8,8 +8,10 @@ DataSift has no public REST API, so we automate the web UI:
 Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 """
 
+import csv
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -1981,6 +1983,334 @@ async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
         result["message"] = f"Phone tag upload failed: {e}"
         logger.error(result["message"])
         await _screenshot(page, "phone_tags_error")
+
+    return result
+
+
+async def upload_address_tags(page: Page, csv_path: str | Path, finish: bool = False) -> dict:
+    """Update existing DataSift records by property address with new Tags.
+
+    Uses "Update Data" -> the "by property address" options (established
+    live-working end-to-end for phone/email in
+    manual_traces/2026-09-06_record_batch/upload_to_datasift.py) to match
+    rows by address instead of creating new records. The CSV passed in only
+    carries Property Street/City/State/ZIP + Tags columns — no phone/email
+    columns — so nothing else on the matched record gets touched even though
+    the phone/email "by property address" checkboxes are what enables
+    address-matching mode.
+
+    The tag itself is applied via the wizard's own "Add tags" step (a
+    "Custom Tags: search or add a new tag" box), not via the CSV's Tags
+    column — live-verified 2026-09-07 that "Tags" sits unmapped in "Map the
+    columns" even with an exact header match, unlike the address fields.
+    That step tags the whole upload batch at once, not per row, so this only
+    behaves correctly when every row in the CSV shares one tag value (true
+    today — address_stage_tracker only ever produces CONVERSION_TAG).
+
+    This writes to a live production CRM, so by default (finish=False) it
+    stops at the column-mapping step and screenshots it instead of advancing
+    to Review/Finish Upload — pass finish=True only after a human has
+    confirmed the screenshots look right for at least one run.
+
+    Args:
+        page: Logged-in Playwright page.
+        csv_path: Path to a CSV with columns Property Street Address /
+            Property City / Property State / Property ZIP Code / Tags (see
+            datasift_formatter._write_conversion_tags_csv).
+        finish: If True, click through Review and Finish Upload. If False
+            (default), stop after the file is uploaded and mapped so the
+            mapping can be reviewed before anything is committed.
+
+    Returns:
+        Dict with {success, message}.
+    """
+    result = {"success": False, "message": ""}
+    csv_path = Path(csv_path)
+
+    if not csv_path.exists():
+        result["message"] = f"Conversion tags CSV not found: {csv_path}"
+        logger.error(result["message"])
+        return result
+
+    # DataSift's "by property address" update wizard does NOT apply a Tags
+    # CSV column via the column mapper — live-verified 2026-09-07 that
+    # "Tags" sits unmapped in "Map the columns" even with an exact header
+    # match. The actual mechanism is the dedicated "Add tags" wizard step
+    # (a "Custom Tags" search-or-add box), which tags the whole batch, not
+    # per row. So we read the CSV's distinct tag value(s) up front and type
+    # them in there instead of relying on column mapping.
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        tags_in_csv = sorted({
+            row["Tags"].strip() for row in csv.DictReader(f) if row.get("Tags", "").strip()
+        })
+    if not tags_in_csv:
+        result["message"] = f"No Tags values found in {csv_path.name}"
+        logger.error(result["message"])
+        return result
+    if len(tags_in_csv) > 1:
+        logger.warning(
+            "CSV has %d distinct tag values %s — the 'Add tags' step applies "
+            "tags to the whole batch, not per-row, so ALL of them will be "
+            "added to EVERY matched record, not just the rows they came from.",
+            len(tags_in_csv), tags_in_csv,
+        )
+
+    try:
+        if "/records" not in page.url:
+            await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+        await _dismiss_popups(page)
+
+        upload_link = page.locator('text="Upload File"')
+        if await upload_link.count() == 0:
+            upload_link = page.locator('a:has-text("Upload")')
+        if await upload_link.count() == 0:
+            await _screenshot(page, "addr_tags_no_upload_link")
+            result["message"] = "Could not find 'Upload File' link"
+            logger.error(result["message"])
+            return result
+        await upload_link.first.click()
+        await page.wait_for_timeout(2000)
+        await _screenshot(page, "addr_tags_upload_page")
+
+        update_btn = page.locator('text="Update Data"')
+        if await update_btn.count() == 0:
+            await _screenshot(page, "addr_tags_no_update_data")
+            result["message"] = "Could not find 'Update Data' button"
+            logger.error(result["message"])
+            return result
+        await update_btn.first.click()
+        await page.wait_for_timeout(2000)
+        logger.info("Selected 'Update Data' mode")
+        await _screenshot(page, "addr_tags_update_data")
+
+        dropdown = page.locator('text="Select one or more options"')
+        if await dropdown.count() == 0:
+            dropdown = page.locator('text="Select one option"')
+        if await dropdown.count() == 0:
+            dropdown = page.locator('[class*="select"], [class*="Select"], [class*="dropdown"]')
+        if await dropdown.count() > 0:
+            await dropdown.first.click()
+            await page.wait_for_timeout(1500)
+            logger.info("Opened update options dropdown")
+        await _screenshot(page, "addr_tags_dropdown_opened")
+
+        options_text = await page.evaluate("""() => {
+            const items = document.querySelectorAll(
+                '[class*="option"], [class*="Option"], [class*="menu"] span, ' +
+                '[class*="Menu"] span, [role="option"], [role="listbox"] > *, li'
+            );
+            return Array.from(items)
+                .map(el => el.textContent.trim())
+                .filter(t => t.length > 0 && t.length < 100);
+        }""")
+        logger.info("Update-data dropdown options: %s", options_text)
+
+        selected_any = False
+        for label in [
+            "Upload phone numbers by property address",
+            "Upload emails by property address",
+        ]:
+            opt = page.locator(f'text="{label}"')
+            if await opt.count() > 0:
+                try:
+                    await opt.first.click(timeout=5000)
+                except PwTimeout:
+                    await opt.first.click(force=True, timeout=3000)
+                await page.wait_for_timeout(800)
+                logger.info("Selected: %s", label)
+                selected_any = True
+
+        if not selected_any:
+            await _screenshot(page, "addr_tags_no_option")
+            result["message"] = (
+                f"Neither 'by property address' option found. Dropdown had: {options_text}"
+            )
+            logger.error(result["message"])
+            return result
+
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(500)
+        await _dismiss_popups(page)
+        await _screenshot(page, "addr_tags_options_selected")
+
+        # "DOES DATA CONTAIN PHONE NUMBERS?" -> No. Our CSV has no phone/email
+        # columns; this just avoids triggering DataSift's own skip-trace add-on.
+        try:
+            phone_q = (
+                page.locator('text="DOES DATA CONTAIN PHONE NUMBERS?"')
+                .locator("..")
+                .locator('text="Select an option"')
+            )
+            if await phone_q.count() > 0:
+                await phone_q.first.click()
+                await page.wait_for_timeout(500)
+                no_opt = page.locator('text="No"')
+                if await no_opt.count() > 0:
+                    await no_opt.first.click()
+                await page.wait_for_timeout(500)
+        except Exception as e:
+            logger.debug("Phone-numbers question not present/skippable: %s", e)
+
+        await _screenshot(page, "addr_tags_setup_filled")
+
+        await _click_next_step(page, timeout=10000)
+        await page.wait_for_timeout(2000)
+        await _dismiss_popups(page)
+        await _screenshot(page, "addr_tags_after_setup")
+
+        # "Add tags" step ("Additional Tags" / "Custom Tags: Search or add a
+        # new tag" input) — this is what actually applies the tag(s), not
+        # the CSV's Tags column.
+        tag_input = page.get_by_placeholder(re.compile("search.*add.*tag", re.I))
+        if await tag_input.count() == 0:
+            tag_input = page.locator('input[placeholder*="tag" i]')
+        if await tag_input.count() == 0:
+            await _screenshot(page, "addr_tags_no_tag_input")
+            result["message"] = "Could not find the Custom Tags input on the Add tags step"
+            logger.error(result["message"])
+            return result
+
+        for tag_value in tags_in_csv:
+            await tag_input.first.click()
+            await tag_input.first.fill(tag_value)
+            await page.wait_for_timeout(800)
+            add_btn = page.get_by_role("button", name=re.compile(r"^Add$", re.I))
+            if await add_btn.count() > 0:
+                await add_btn.first.click()
+            else:
+                await tag_input.first.press("Enter")
+            await page.wait_for_timeout(800)
+            logger.info("Added custom tag: %s", tag_value)
+
+        await _screenshot(page, "addr_tags_tags_added")
+
+        await _click_next_step(page, timeout=5000)
+        await page.wait_for_timeout(1000)
+        await _dismiss_popups(page)
+
+        file_input = page.locator('input[type="file"]')
+        if await file_input.count() == 0:
+            await page.wait_for_timeout(2000)
+            file_input = page.locator('input[type="file"]')
+        if await file_input.count() == 0:
+            await _screenshot(page, "addr_tags_no_file_input")
+            result["message"] = "Could not find file input for upload"
+            logger.error(result["message"])
+            return result
+        await file_input.first.set_input_files(str(csv_path.resolve()))
+        await page.wait_for_timeout(3000)
+        logger.info("Uploaded conversion tags file: %s", csv_path.name)
+        await _screenshot(page, "addr_tags_file_uploaded")
+
+        await _click_next_step(page, timeout=10000)
+        await page.wait_for_timeout(3000)
+        await _dismiss_popups(page)
+        await _screenshot(page, "addr_tags_column_mapping")
+
+        if not finish:
+            result["success"] = True
+            result["message"] = (
+                f"Stopped before Finish Upload for review (dry run) — {csv_path.name}. "
+                "Re-run with finish=True after confirming the mapping/review screenshots."
+            )
+            logger.info(result["message"])
+            return result
+
+        max_steps = 4
+        for step_num in range(max_steps):
+            finish_btn = page.locator('button:has-text("Finish Upload")')
+            if await finish_btn.count() > 0:
+                await finish_btn.first.click()
+                await page.wait_for_timeout(5000)
+                logger.info("Clicked 'Finish Upload' for conversion tags")
+                await _screenshot(page, "addr_tags_completed")
+                result["success"] = True
+                result["message"] = f"Conversion tags uploaded: {csv_path.name}"
+                return result
+
+            next_btn = page.locator('button:has-text("Next Step")')
+            if await next_btn.count() == 0:
+                next_btn = page.locator('button:has-text("Next")')
+            if await next_btn.count() > 0:
+                await next_btn.first.click()
+                await page.wait_for_timeout(3000)
+                await _screenshot(page, f"addr_tags_review_step{step_num + 1}")
+            else:
+                await _screenshot(page, f"addr_tags_stuck{step_num + 1}")
+                logger.warning("No Next Step or Finish button at review step %d", step_num + 1)
+                break
+
+        result["message"] = "Wizard did not reach Finish Upload in expected steps"
+        logger.warning(result["message"])
+
+    except Exception as e:
+        result["message"] = f"Conversion tag upload failed: {e}"
+        logger.error(result["message"])
+        await _screenshot(page, "addr_tags_error")
+
+    return result
+
+
+async def run_conversion_tag_workflow(
+    *,
+    csv_path: str,
+    email: str | None = None,
+    password: str | None = None,
+    headless: bool = False,
+    finish: bool = False,
+) -> dict:
+    """Top-level orchestrator for the update-conversion-tags CLI command.
+
+    Logs into DataSift and runs upload_address_tags() against the given
+    conversion-tags CSV (see datasift_formatter._write_conversion_tags_csv).
+
+    Args:
+        csv_path: Path to the address+Tags CSV to upload.
+        email: DataSift login email (defaults to config.DATASIFT_EMAIL).
+        password: DataSift login password (defaults to config.DATASIFT_PASSWORD).
+        headless: Run browser headless (default False — this writes to
+            production, worth watching at least the first few times).
+        finish: If True, actually commit the update. Default False (dry run
+            that stops at the review screen for a human look).
+
+    Returns:
+        Dict with workflow results.
+    """
+    import config as _cfg
+
+    email = email or _cfg.DATASIFT_EMAIL
+    password = password or _cfg.DATASIFT_PASSWORD
+
+    result = {"success": False, "message": ""}
+
+    if not email or not password:
+        result["message"] = "DATASIFT_EMAIL and DATASIFT_PASSWORD required"
+        logger.error(result["message"])
+        return result
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+
+        try:
+            logged_in = await login(page, email, password)
+            if not logged_in:
+                result["message"] = "DataSift login failed"
+                return result
+
+            upload_result = await upload_address_tags(page, csv_path, finish=finish)
+            result.update(upload_result)
+        finally:
+            await browser.close()
 
     return result
 

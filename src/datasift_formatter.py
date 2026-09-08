@@ -16,6 +16,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from address_stage_tracker import check_and_record, load_registry, save_registry
 from config import ESTATE_OF_RE, OUTPUT_DIR
 from notice_parser import NoticeData
 
@@ -684,19 +685,109 @@ def _validate_row(row: dict) -> tuple[bool, list[str]]:
     return (len(issues) == 0, issues)
 
 
-def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
+CONVERSION_TAG_COLUMNS = [
+    "Property Street Address",
+    "Property City",
+    "Property State",
+    "Property ZIP Code",
+    "Tags",
+]
+
+
+def _write_conversion_tags_csv(
+    notices: list[NoticeData], conversions: dict[int, str]
+) -> Path | None:
+    """Write a small by-address update CSV for detected stage conversions.
+
+    Consumed by datasift_uploader.upload_address_tags() via DataSift's
+    "Update Data -> by property address" flow, which matches and updates
+    existing records by address instead of creating new ones. Returns None
+    if there were no conversions in this batch.
+    """
+    rows = [
+        {
+            "Property Street Address": notice.address,
+            "Property City": notice.city,
+            "Property State": notice.state or "FL",
+            "Property ZIP Code": notice.zip,
+            "Tags": tag,
+        }
+        for notice in notices
+        if (tag := conversions.get(id(notice)))
+    ]
+    if not rows:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    path = OUTPUT_DIR / f"datasift_conversion_tags_{timestamp}.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CONVERSION_TAG_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info("Wrote %d conversion tag(s) for DataSift address update -> %s", len(rows), path)
+    return path
+
+
+def _compute_conversion_tags(
+    notices: list[NoticeData], registry: dict | None = None
+) -> dict[int, str]:
+    """Detect preforeclosure->foreclosure address conversions for a batch.
+
+    Checks each notice against the cross-run address/stage registry and
+    returns {id(notice): tag} for the notices that represent a stage-up
+    conversion. See address_stage_tracker.py for why this exists. As a side
+    effect, writes a small address+tag CSV (via _write_conversion_tags_csv)
+    for any conversions found, ready for datasift_uploader.upload_address_tags().
+
+    Args:
+        notices: Notices being formatted for this upload.
+        registry: If provided, mutated in place and NOT persisted here — the
+            caller owns loading/saving it (e.g. main.py's Apify cloud path
+            persists it via the "siftstack-state" key-value store, the same
+            way seen_notice_ids works, since a local JSON file next to this
+            module does not survive between Actor container runs). If None
+            (local CLI runs, tests), falls back to a self-contained local
+            JSON file via address_stage_tracker.load_registry/save_registry.
+    """
+    owns_persistence = registry is None
+    if registry is None:
+        registry = load_registry()
+
+    conversions: dict[int, str] = {}
+    for notice in notices:
+        tag = check_and_record(notice, registry)
+        if tag:
+            conversions[id(notice)] = tag
+            logger.info("Stage conversion detected for %s: %s", notice.address, tag)
+    if owns_persistence:
+        save_registry(registry)
+    _write_conversion_tags_csv(notices, conversions)
+    return conversions
+
+
+def _build_row(
+    notice: NoticeData,
+    notes_override: str | None = None,
+    conversion_tag: str | None = None,
+) -> dict:
     """Build a single CSV row dict for a NoticeData record.
 
     Args:
         notice: The notice to format.
         notes_override: If provided, use this as the Notes value instead of
             calling _build_notes(). Used by write_datasift_split_csvs().
+        conversion_tag: If provided (from _compute_conversion_tags()),
+            appended to the Tags column to flag a preforeclosure->foreclosure
+            address conversion.
 
     Returns:
         Dict keyed by DATASIFT_COLUMNS headers.
     """
     contact = _get_contact_info(notice)
     tags = _build_tags(notice)
+    if conversion_tag:
+        tags = f"{tags},{conversion_tag}"
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(notice)
 
@@ -813,12 +904,17 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
 def write_datasift_csv(
     notices: list[NoticeData],
     filename: str | None = None,
+    stage_registry: dict | None = None,
 ) -> Path:
     """Write notices to a DataSift-formatted CSV file.
 
     Args:
         notices: List of enriched NoticeData objects.
         filename: Optional filename override.
+        stage_registry: See _compute_conversion_tags — pass the Apify KVS
+            "address_stage_history" dict here in cloud runs so conversion
+            tracking persists across container runs; leave None for local
+            CLI runs (self-contained local-file persistence).
 
     Returns:
         Path to the written CSV file.
@@ -831,13 +927,14 @@ def write_datasift_csv(
     written = 0
     incomplete = 0
     issue_counts: dict[str, int] = {}
+    conversions = _compute_conversion_tags(notices, registry=stage_registry)
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
 
         for notice in notices:
-            row = _build_row(notice)
+            row = _build_row(notice, conversion_tag=conversions.get(id(notice)))
             is_complete, issues = _validate_row(row)
             if not is_complete:
                 incomplete += 1
@@ -860,6 +957,7 @@ def write_datasift_csv(
 def write_datasift_split_csvs(
     notices: list[NoticeData],
     date_str: str | None = None,
+    stage_registry: dict | None = None,
 ) -> list[dict]:
     """Generate separate DM and Heir Map CSVs for two-upload Message Board flow.
 
@@ -872,6 +970,10 @@ def write_datasift_split_csvs(
     Args:
         notices: List of enriched NoticeData objects.
         date_str: Optional date string for filenames/list names (default: today).
+        stage_registry: See _compute_conversion_tags — pass the Apify KVS
+            "address_stage_history" dict here in cloud runs so conversion
+            tracking persists across container runs; leave None for local
+            CLI runs (self-contained local-file persistence).
 
     Returns:
         List of dicts: [{"path": Path, "label": str, "list_name": str}, ...]
@@ -882,6 +984,7 @@ def write_datasift_split_csvs(
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results = []
+    conversions = _compute_conversion_tags(notices, registry=stage_registry)
 
     # CSV 1: DMs — all records
     dm_path = OUTPUT_DIR / f"datasift_upload_DMs_{timestamp}.csv"
@@ -892,7 +995,11 @@ def write_datasift_split_csvs(
         writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
         for notice in notices:
-            row = _build_row(notice, notes_override=_build_dm_notes(notice))
+            row = _build_row(
+                notice,
+                notes_override=_build_dm_notes(notice),
+                conversion_tag=conversions.get(id(notice)),
+            )
             is_complete, issues = _validate_row(row)
             if not is_complete:
                 incomplete += 1
@@ -931,7 +1038,11 @@ def write_datasift_split_csvs(
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
             for notice in deceased_with_heirs:
-                row = _build_row(notice, notes_override=_build_heir_notes(notice))
+                row = _build_row(
+                    notice,
+                    notes_override=_build_heir_notes(notice),
+                    conversion_tag=conversions.get(id(notice)),
+                )
                 writer.writerow(row)
                 heir_written += 1
 

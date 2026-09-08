@@ -65,7 +65,7 @@ def _preflight_check(mode: str, searches=None) -> list[str]:
     # ── Credential checks (mode-dependent) ──────────────────────────
     scrape_modes = {"daily", "historical"}
     enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
-    datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
+    datasift_modes = {"manage-presets", "manage-sold", "phone-validate", "update-conversion-tags"}
 
     # Skip TNPN-specific checks when no search in this run needs TNPN
     # (JDR and Duval Clerk are both public portals — no login or CAPTCHA required).
@@ -336,6 +336,14 @@ async def actor_main() -> None:
             # ── Load cross-run seen-ID cache from KVS (makes daily re-runs idempotent) ──
             seen_ids = await kvs.get_value("seen_notice_ids") or {}
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
+
+            # ── Load cross-run address/stage registry from KVS (lis_pendens ──
+            # -> foreclosure conversion tracking; see address_stage_tracker.py).
+            # A local file next to datasift_formatter.py would not survive
+            # between Actor container runs, so this dict is threaded through
+            # write_datasift_split_csvs() and persisted back to KVS below.
+            stage_registry = await kvs.get_value("address_stage_history") or {}
+            Actor.log.info("Loaded %d addresses from stage-conversion registry", len(stage_registry))
 
             # ── Load last released-through date (Duval Clerk catch-up logic) ──
             last_released_through = await kvs.get_value("last_released_through_date") or None
@@ -612,8 +620,8 @@ async def actor_main() -> None:
             try:
                 from datasift_formatter import write_datasift_split_csvs
 
-                csv_infos = write_datasift_split_csvs(notices)
-                kvs = await Actor.open_key_value_store(name="siftstack-state")
+                csv_infos = write_datasift_split_csvs(notices, stage_registry=stage_registry)
+                await kvs.set_value("address_stage_history", stage_registry)
                 for info in csv_infos:
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
                     with open(info["path"], "rb") as f:
@@ -1290,6 +1298,41 @@ def _run_manage_sold(args) -> None:
         sys.exit(1)
 
 
+def _run_update_conversion_tags(args) -> None:
+    """Push preforeclosure->foreclosure address-conversion tags to DataSift.
+
+    Consumes an output/datasift_conversion_tags_*.csv (written automatically
+    by datasift_formatter.py whenever a run's DataSift upload CSV includes an
+    address that previously came through at an earlier notice_type stage —
+    see address_stage_tracker.py). Defaults to a dry run that stops before
+    Finish Upload; pass --finish to actually commit.
+    """
+    from datasift_uploader import run_conversion_tag_workflow
+
+    csv_path = getattr(args, "csv_path", None)
+    if not csv_path:
+        candidates = sorted(config.OUTPUT_DIR.glob("datasift_conversion_tags_*.csv"))
+        if not candidates:
+            logging.error(
+                "update-conversion-tags requires --csv-path, and no "
+                "output/datasift_conversion_tags_*.csv file was found"
+            )
+            sys.exit(1)
+        csv_path = str(candidates[-1])
+        logging.info("No --csv-path given, using latest: %s", csv_path)
+
+    result = asyncio.run(run_conversion_tag_workflow(
+        csv_path=csv_path,
+        finish=getattr(args, "finish", False),
+    ))
+
+    if result.get("success"):
+        logging.info("Update conversion tags: %s", result.get("message", "OK"))
+    else:
+        logging.error("Update conversion tags failed: %s", result.get("message"))
+        sys.exit(1)
+
+
 def cli_main() -> None:
     """Run as standalone CLI."""
     parser = argparse.ArgumentParser(
@@ -1303,7 +1346,7 @@ def cli_main() -> None:
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
-            "playbook", "sync-apify-output",
+            "playbook", "sync-apify-output", "update-conversion-tags",
         ],
         help=(
             "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
@@ -1315,7 +1358,9 @@ def cli_main() -> None:
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
             "lead-manage = 4 Pillars qualification; setup-sequences = CRM automation; "
             "niche-sequential = marketing cycle; playbook = SOP generator; "
-            "sync-apify-output = download latest cloud run's CSVs to local output/"
+            "sync-apify-output = download latest cloud run's CSVs to local output/; "
+            "update-conversion-tags = push preforeclosure->foreclosure address tags "
+            "(from output/datasift_conversion_tags_*.csv) to existing DataSift records"
         ),
     )
     parser.add_argument(
@@ -1449,6 +1494,14 @@ def cli_main() -> None:
         type=str,
         default=None,
         help='County name for CSV import, e.g. "Knox" (sets county for records missing it)',
+    )
+    parser.add_argument(
+        "--finish",
+        action="store_true",
+        help=(
+            "Actually commit the DataSift write instead of stopping at the review "
+            "screen for a human look (update-conversion-tags mode, default: dry run)"
+        ),
     )
 
     parser.add_argument(
@@ -1966,6 +2019,11 @@ def cli_main() -> None:
     # Manage sold properties mode — SiftMap workflow
     if args.mode == "manage-sold":
         _run_manage_sold(args)
+        return
+
+    # Push preforeclosure->foreclosure address-conversion tags to DataSift
+    if args.mode == "update-conversion-tags":
+        _run_update_conversion_tags(args)
         return
 
     # Sync Apify cloud run output — downloads the daily scheduled run's
