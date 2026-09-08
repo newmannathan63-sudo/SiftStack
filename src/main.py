@@ -7,6 +7,7 @@ Runs as either:
 
 import argparse
 import asyncio
+import csv
 import logging
 import os
 import sys
@@ -617,6 +618,7 @@ async def actor_main() -> None:
             datasift_csv_urls = []
             datasift_upload_result: dict = {}
             csv_infos: list[dict] = []
+            conversion_rows: list[dict] = []
             try:
                 from datasift_formatter import write_datasift_split_csvs
 
@@ -630,6 +632,26 @@ async def actor_main() -> None:
                     url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
                     datasift_csv_urls.append({"label": info["label"], "url": url, "records": info.get("count", "?")})
                     Actor.log.info("DataSift CSV (%s) saved to KVS: %s", info["label"], key)
+
+                # write_datasift_split_csvs() writes a conversion-tags CSV as a
+                # side effect (see datasift_formatter._write_conversion_tags_csv)
+                # whenever a stage-up (lis_pendens -> foreclosure) is detected.
+                # It's a plain OUTPUT_DIR file, not part of csv_infos, so without
+                # this it would only exist on the Actor's ephemeral container
+                # filesystem and be gone the moment this run ends.
+                conversion_csvs = sorted(config.OUTPUT_DIR.glob("datasift_conversion_tags_*.csv"))
+                if conversion_csvs:
+                    conv_path = conversion_csvs[-1]
+                    with open(conv_path, newline="", encoding="utf-8") as f:
+                        conversion_rows = list(csv.DictReader(f))
+                    with open(conv_path, "rb") as f:
+                        await kvs.set_value(
+                            "datasift_conversion_tags.csv", f.read(), content_type="text/csv"
+                        )
+                    Actor.log.info(
+                        "Conversion-tags CSV (%d address(es)) saved to KVS: datasift_conversion_tags.csv",
+                        len(conversion_rows),
+                    )
             except Exception as e:
                 Actor.log.error("DataSift CSV generation failed: %s", e)
 
@@ -689,6 +711,31 @@ async def actor_main() -> None:
                         elapsed_min=elapsed_min,
                         cost_breakdown=cost_breakdown,
                     )
+
+                    # Flag preforeclosure->foreclosure conversions — these are
+                    # rare and easy to miss in the regular run summary, and the
+                    # conversion-tags CSV needs a manual, reviewed push (not
+                    # auto-applied) to actually land the tag in DataSift.
+                    if conversion_rows:
+                        addr_lines = []
+                        for row in conversion_rows[:10]:
+                            addr = row.get("Property Street Address", "")
+                            city = row.get("Property City", "")
+                            state = row.get("Property State", "")
+                            owner = row.get("Owner", "")
+                            loc = f"{addr}, {city}, {state}".strip(", ")
+                            addr_lines.append(f"  • {loc}" + (f" — {owner}" if owner else ""))
+                        if len(conversion_rows) > 10:
+                            addr_lines.append(f"  ... and {len(conversion_rows) - 10} more")
+
+                        _send_webhook(
+                            f"*Preforeclosure->Foreclosure conversion(s) detected:* "
+                            f"{len(conversion_rows)}\n" + "\n".join(addr_lines) + "\n"
+                            "After the next `sync-apify-output`, review and push with:\n"
+                            "`python main.py update-conversion-tags --csv-path "
+                            "output/apify_datasift_conversion_tags_<timestamp>.csv --finish`",
+                            config.SLACK_WEBHOOK_URL,
+                        )
 
                     # Send DataSift upload status
                     if datasift_upload_result:
@@ -1301,21 +1348,27 @@ def _run_manage_sold(args) -> None:
 def _run_update_conversion_tags(args) -> None:
     """Push preforeclosure->foreclosure address-conversion tags to DataSift.
 
-    Consumes an output/datasift_conversion_tags_*.csv (written automatically
-    by datasift_formatter.py whenever a run's DataSift upload CSV includes an
-    address that previously came through at an earlier notice_type stage —
-    see address_stage_tracker.py). Defaults to a dry run that stops before
-    Finish Upload; pass --finish to actually commit.
+    Consumes a conversion-tags CSV — either written locally by
+    datasift_formatter.py (datasift_conversion_tags_*.csv, for CLI/local
+    runs) or synced down from an Apify cloud run via `sync-apify-output`
+    (apify_datasift_conversion_tags_*.csv — see address_stage_tracker.py for
+    why the cloud path needs Apify's key-value store rather than a local
+    file). Defaults to a dry run that stops before Finish Upload; pass
+    --finish to actually commit.
     """
     from datasift_uploader import run_conversion_tag_workflow
 
     csv_path = getattr(args, "csv_path", None)
     if not csv_path:
-        candidates = sorted(config.OUTPUT_DIR.glob("datasift_conversion_tags_*.csv"))
+        candidates = sorted(
+            list(config.OUTPUT_DIR.glob("datasift_conversion_tags_*.csv"))
+            + list(config.OUTPUT_DIR.glob("apify_datasift_conversion_tags_*.csv")),
+            key=lambda p: p.stat().st_mtime,
+        )
         if not candidates:
             logging.error(
                 "update-conversion-tags requires --csv-path, and no "
-                "output/datasift_conversion_tags_*.csv file was found"
+                "*datasift_conversion_tags_*.csv file was found in output/"
             )
             sys.exit(1)
         csv_path = str(candidates[-1])

@@ -691,6 +691,10 @@ CONVERSION_TAG_COLUMNS = [
     "Property State",
     "Property ZIP Code",
     "Tags",
+    # Not a DataSift field name, so it's ignored (unmapped) by the "by
+    # property address" upload wizard — included purely so a human (or the
+    # Slack notification) can identify the record without opening DataSift.
+    "Owner",
 ]
 
 
@@ -704,17 +708,21 @@ def _write_conversion_tags_csv(
     existing records by address instead of creating new ones. Returns None
     if there were no conversions in this batch.
     """
-    rows = [
-        {
+    rows = []
+    for notice in notices:
+        tag = conversions.get(id(notice))
+        if not tag:
+            continue
+        contact = _get_contact_info(notice)
+        owner = " ".join(part for part in (contact["first"], contact["last"]) if part)
+        rows.append({
             "Property Street Address": notice.address,
             "Property City": notice.city,
             "Property State": notice.state or "FL",
             "Property ZIP Code": notice.zip,
             "Tags": tag,
-        }
-        for notice in notices
-        if (tag := conversions.get(id(notice)))
-    ]
+            "Owner": owner,
+        })
     if not rows:
         return None
 
