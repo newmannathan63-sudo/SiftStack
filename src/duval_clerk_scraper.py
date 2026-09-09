@@ -36,6 +36,7 @@ from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwrig
 
 import config
 from config import REQUEST_DELAY_MAX, REQUEST_DELAY_MIN, SavedSearch
+from dropbox_uploader import _get_client as _dropbox_client, upload_bytes_and_share
 from jdr_scraper import (
     FL_DUVAL_CITIES,
     FL_ZIP_RE,
@@ -318,12 +319,18 @@ async def _fetch_lp_details(page: Page, instrument_cell) -> dict:
                 pass
 
 
-async def _fetch_and_ocr_lp_document(page: Page, instrument_cell) -> dict:
+async def _fetch_and_ocr_lp_document(page: Page, instrument_cell, dbx=None) -> dict:
     """Fetch the actual recorded LP document's details + image, and OCR the
     image for ground-truth property address / parcel ID. Returns whatever it
     could get — at minimum the Details-page case_number even if the image
     is unavailable or OCR fails entirely; callers fall back to the existing
     DCPA name-lookup tier for anything still missing.
+
+    Also re-hosts the recorded PDF on Dropbox and returns its public share
+    URL as filing_pdf_url, if a Dropbox client is available. The clerk
+    portal's own document URL is bound to the scraper's browser session —
+    verified 2026-09-08 that it 401s once that session ends — so it can't be
+    handed to DataSift directly for later viewing.
     """
     details = await _fetch_lp_details(page, instrument_cell)
     base: dict = {}
@@ -333,6 +340,14 @@ async def _fetch_and_ocr_lp_document(page: Page, instrument_cell) -> dict:
     pdf_bytes = details["pdf_bytes"]
     if not pdf_bytes:
         return base
+
+    if dbx is not None:
+        dest_name = details["case_number"] or hashlib.sha1(pdf_bytes).hexdigest()[:12]
+        dest_path = f"/Duval Lis Pendens Filings/{dest_name}.pdf"
+        filing_url = upload_bytes_and_share(pdf_bytes, dest_path, dbx=dbx)
+        if filing_url:
+            base["filing_pdf_url"] = filing_url
+
     try:
         from image_utils import fix_rotation, ocr_page, render_pdf_bytes
         images = render_pdf_bytes(pdf_bytes, dpi=300)
@@ -346,6 +361,8 @@ async def _fetch_and_ocr_lp_document(page: Page, instrument_cell) -> dict:
         # scan found.
         if base.get("case_number"):
             parsed["case_number"] = base["case_number"]
+        if base.get("filing_pdf_url"):
+            parsed["filing_pdf_url"] = base["filing_pdf_url"]
         return parsed
     except Exception as e:
         logger.debug("  LP document OCR failed: %s", e)
@@ -800,6 +817,10 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
     rows = await result_tbl.query_selector_all("tr")
     results: list[tuple[str, str, dict]] = []
     doc_fetch_count = 0
+    # Created lazily on first row that needs a document fetch, then reused for
+    # the rest of this page — avoids re-authenticating with Dropbox per row.
+    # False (not None) marks "already tried and failed" so we don't retry.
+    dbx_client = None
     # NOTE: `.k-grid-content table` is Kendo's scrollable grid-BODY table —
     # its header lives in a separate `.k-grid-header` table, so every <tr>
     # here is already a data row (verified live 2026-07-14: a 5-row search
@@ -878,9 +899,18 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
                 # on exactly this with no further log output. Ground-truth
                 # data is best-effort; callers already fall back to the DCPA
                 # name-lookup tier when doc_fields is empty.
+                if dbx_client is None:
+                    try:
+                        dbx_client = _dropbox_client()
+                    except Exception as e:
+                        logger.debug("  Dropbox client init failed — filing PDFs won't be hosted: %s", e)
+                        dbx_client = False
                 try:
                     doc_fields = await asyncio.wait_for(
-                        _fetch_and_ocr_lp_document(page, cells[3 + _offset]), timeout=45
+                        _fetch_and_ocr_lp_document(
+                            page, cells[3 + _offset], dbx=(dbx_client or None)
+                        ),
+                        timeout=45,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("  LP document fetch+OCR timed out after 45s — skipping ground truth for this row")
@@ -891,6 +921,12 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
             results.append((rec_date, row_text, doc_fields))
         except Exception:
             continue
+
+    if dbx_client:
+        try:
+            dbx_client.close()
+        except Exception:
+            pass
 
     logger.info("DuvalClerk: extracted %d rows from HTML table (includes unreleased records)", len(results))
     if doc_fetch_count:
@@ -973,6 +1009,49 @@ async def _parse_released_through_date(page: Page) -> str | None:
             return _norm_date(m.group(1))
     except Exception:
         pass
+    return None
+
+
+def _stale_released_through_warning(released_through: str | None, now: datetime | None = None) -> str | None:
+    """Flag a "Released through" date that hasn't kept pace with business days.
+
+    The clerk's office records Monday-Friday, so released_through should
+    normally trail "now" by at most one business day (accounting for
+    weekends). If it's further behind than that, the scrape most likely
+    silently got a stale/degraded response (e.g. a datacenter IP being
+    served cached data — see the proxy_url note above) rather than the
+    courthouse genuinely having zero filings for multiple business days.
+
+    Returns a human-readable warning string, or None if released_through
+    looks fresh (or is missing, which is handled elsewhere).
+    """
+    if not released_through:
+        return None
+    now = now or datetime.now()
+    try:
+        rt_date = datetime.strptime(released_through, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+    # Walk back from "now" to the most recent prior business day — that's
+    # the freshest released_through we should expect to see.
+    expected_floor = now - timedelta(days=1)
+    while expected_floor.weekday() >= 5:  # Sat=5, Sun=6
+        expected_floor -= timedelta(days=1)
+    expected_floor = expected_floor.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if rt_date.date() < expected_floor.date():
+        business_days_behind = 0
+        cursor = rt_date
+        while cursor.date() < expected_floor.date():
+            cursor += timedelta(days=1)
+            if cursor.weekday() < 5:
+                business_days_behind += 1
+        return (
+            f"released_through={released_through} is {business_days_behind} business "
+            f"day(s) behind expected floor {expected_floor.strftime('%Y-%m-%d')} — "
+            "likely a stale/degraded response, not a genuine multi-day gap in filings"
+        )
     return None
 
 
@@ -1266,6 +1345,8 @@ async def _scrape_duval_clerk_search(
             notice.parcel_id = doc_fields["parcel_id"]
         if doc_fields.get("case_number"):
             notice.case_number = doc_fields["case_number"]
+        if doc_fields.get("filing_pdf_url"):
+            notice.filing_pdf_url = doc_fields["filing_pdf_url"]
 
         pending.append((nhash, notice, row_text))
 
@@ -1350,7 +1431,10 @@ async def scrape_duval_clerk_all(
         since_date:             ISO date string (YYYY-MM-DD); only records on/after.
         seen_ids:               Cross-run dedup dict {hash: date}; updated in-place.
         llm_api_key:            Anthropic API key for LLM address fallback.
-        proxy_url:              Optional proxy URL (unused — see note in code).
+        proxy_url:              Optional proxy URL (e.g. Apify residential proxy).
+                                or.duvalclerk.com degrades responses to datacenter
+                                IPs (confirmed 2026-09-08) — route through this to
+                                get live data instead of a stale cached snapshot.
         last_released_through:  Released-through date from the previous run (KVS).
                                 When set and the current released-through has advanced,
                                 a catch-up search is run for the newly-released window.
@@ -1375,19 +1459,39 @@ async def scrape_duval_clerk_all(
     all_notices: list[NoticeData] = []
     current_released_through: str | None = None
 
+    launch_opts: dict = {
+        "headless": True,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+    # or.duvalclerk.com silently degrades responses to Apify's datacenter IP —
+    # confirmed 2026-09-08: the site returns HTTP 200 fast (no timeout, no error)
+    # but the "Released through date" banner and search results were frozen at
+    # 09/02/2026 for 5+ straight days from Apify's IP, while the identical code
+    # run from a residential/non-datacenter IP the same day saw 09/07/2026 and
+    # 35 records the datacenter path never found. This is the same class of bug
+    # already fixed for JDR (see jdr_scraper.py) — route through the residential
+    # proxy to match. A prior attempt at this reportedly caused domcontentloaded
+    # timeouts; the longer timeout below (60s vs the previous 30s) addresses that.
+    if proxy_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        proxy_cfg: dict = {
+            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+        }
+        if parsed.username:
+            proxy_cfg["username"] = parsed.username
+        if parsed.password:
+            proxy_cfg["password"] = parsed.password
+        launch_opts["proxy"] = proxy_cfg
+        logger.info("DuvalClerk: using proxy %s:%s", parsed.hostname, parsed.port)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        # No proxy for Duval Clerk — or.duvalclerk.com is a public government
-        # portal that loads fine from datacenter IPs. Routing through the
-        # residential proxy caused domcontentloaded to time out (30s+).
+        browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1398,7 +1502,7 @@ async def scrape_duval_clerk_all(
         await context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
-        context.set_default_timeout(30_000)
+        context.set_default_timeout(60_000)
         page = await context.new_page()
 
         for search in dc_only:
@@ -1423,4 +1527,11 @@ async def scrape_duval_clerk_all(
         "DuvalClerk complete: %d total records across %d search(es)",
         len(all_notices), len(dc_only),
     )
+
+    stale_msg = _stale_released_through_warning(current_released_through)
+    if stale_msg:
+        logger.warning("DuvalClerk: %s", stale_msg)
+        if failures is not None:
+            failures.append(f"DuvalClerk released-through stale: {stale_msg}")
+
     return all_notices, current_released_through

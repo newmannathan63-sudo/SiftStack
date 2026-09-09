@@ -109,6 +109,8 @@ DATASIFT_COLUMNS = [
     "Scheduled Auction Date",
     # ── Lis pendens week-sorting (SiftStack "Recorded Lis Pendens Date" field) ──
     "Recorded Lis Pendens Date",
+    # ── Duval lis pendens filing PDF (glance at the recorded document before calling) ──
+    "Filing PDF",
 ]
 
 
@@ -906,6 +908,8 @@ def _build_row(
         "Scheduled Auction Date": _format_date(notice.auction_date),
         # ── Lis pendens week-sorting ──
         "Recorded Lis Pendens Date": recorded_lis_pendens,
+        # ── Duval lis pendens filing PDF ──
+        "Filing PDF": notice.filing_pdf_url,
     }
 
 

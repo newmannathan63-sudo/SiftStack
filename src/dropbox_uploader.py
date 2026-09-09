@@ -62,6 +62,49 @@ def _ensure_shared_link(dbx: dropbox.Dropbox, path: str) -> str:
         raise
 
 
+def upload_bytes_and_share(
+    data: bytes,
+    dropbox_dest_path: str,
+    dbx: dropbox.Dropbox | None = None,
+) -> str | None:
+    """Upload in-memory bytes to Dropbox and return a public share URL.
+
+    Args:
+        data: file content to upload.
+        dropbox_dest_path: absolute path in Dropbox (must start with "/").
+        dbx: optional preexisting client (lets callers upload many files
+            in a single session without re-authenticating).
+
+    Returns:
+        Public share URL, or None on any failure (logged with context).
+    """
+    close_after = False
+    if dbx is None:
+        try:
+            dbx = _get_client()
+            close_after = True
+        except Exception:
+            logger.exception("Dropbox client init failed")
+            return None
+
+    try:
+        dbx.files_upload(
+            data, dropbox_dest_path, mode=WriteMode.overwrite, mute=True,
+        )
+        url = _ensure_shared_link(dbx, dropbox_dest_path)
+        logger.info("Dropbox uploaded: %s (%d bytes) → %s", dropbox_dest_path, len(data), url)
+        return url
+    except Exception:
+        logger.exception("Dropbox upload failed: %s", dropbox_dest_path)
+        return None
+    finally:
+        if close_after:
+            try:
+                dbx.close()
+            except Exception:
+                pass
+
+
 def upload_and_share(
     local_path: Path,
     dropbox_dest_path: str,
@@ -83,33 +126,9 @@ def upload_and_share(
         logger.warning("Dropbox upload skipped — file missing: %s", local_path)
         return None
 
-    close_after = False
-    if dbx is None:
-        try:
-            dbx = _get_client()
-            close_after = True
-        except Exception:
-            logger.exception("Dropbox client init failed")
-            return None
-
-    try:
-        with open(local_path, "rb") as f:
-            data = f.read()
-        dbx.files_upload(
-            data, dropbox_dest_path, mode=WriteMode.overwrite, mute=True,
-        )
-        url = _ensure_shared_link(dbx, dropbox_dest_path)
-        logger.info("Dropbox uploaded: %s → %s", local_path.name, url)
-        return url
-    except Exception:
-        logger.exception("Dropbox upload failed: %s → %s", local_path, dropbox_dest_path)
-        return None
-    finally:
-        if close_after:
-            try:
-                dbx.close()
-            except Exception:
-                pass
+    with open(local_path, "rb") as f:
+        data = f.read()
+    return upload_bytes_and_share(data, dropbox_dest_path, dbx=dbx)
 
 
 def upload_batch(

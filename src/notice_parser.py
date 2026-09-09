@@ -93,6 +93,9 @@ class NoticeData:
     # County assessor / tax fields
     parcel_id: str = ""                # County assessor parcel ID
     case_number: str = ""              # Court case/UCN (e.g. FL "16-2026-CA-004689-AXXX-MA")
+    filing_pdf_url: str = ""           # Duval lis pendens — our own hosted copy of the recorded
+                                        # filing PDF (clerk portal's own link is session-bound and
+                                        # returns 401 once the scrape's browser session ends)
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
     tax_delinquent_years: str = ""     # Number of years delinquent
     # Deceased owner detection
