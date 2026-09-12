@@ -1490,8 +1490,11 @@ async def scrape_duval_clerk_all(
         launch_opts["proxy"] = proxy_cfg
         logger.info("DuvalClerk: using proxy %s:%s", parsed.hostname, parsed.port)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_opts)
+    async def _new_browser_and_page(use_proxy: bool):
+        opts = dict(launch_opts)
+        if not use_proxy:
+            opts.pop("proxy", None)
+        browser = await p.chromium.launch(**opts)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1504,8 +1507,24 @@ async def scrape_duval_clerk_all(
         )
         context.set_default_timeout(60_000)
         page = await context.new_page()
+        return browser, page
 
-        for search in dc_only:
+    # Residential-proxy sessions from Apify are occasionally handed a exit
+    # node that can't tunnel to or.duvalclerk.com at all (net::ERR_TUNNEL_
+    # CONNECTION_FAILED, seen 2026-09-09/10/12 — a hard connect failure, not
+    # the slow/stale response the proxy was added to fix). That's worse than
+    # the pre-proxy datacenter path, which at least returned data (if
+    # possibly stale). Fall back to a proxy-less browser once per run so a
+    # bad session doesn't zero out the whole day.
+    _PROXY_FAILURE_MARKERS = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED")
+
+    async with async_playwright() as p:
+        using_proxy = bool(proxy_url)
+        browser, page = await _new_browser_and_page(using_proxy)
+
+        idx = 0
+        while idx < len(dc_only):
+            search = dc_only[idx]
             try:
                 batch, rt = await _scrape_duval_clerk_search(
                     page, search, since_date, seen_ids, llm_api_key,
@@ -1514,12 +1533,25 @@ async def scrape_duval_clerk_all(
                 all_notices.extend(batch)
                 if rt:
                     current_released_through = rt
+                idx += 1
             except Exception as exc:
+                if using_proxy and any(m in str(exc) for m in _PROXY_FAILURE_MARKERS):
+                    logger.warning(
+                        "DuvalClerk: residential proxy session couldn't tunnel to the "
+                        "site (%s) — falling back to a direct connection for this run. "
+                        "Data may be stale if the site is degrading datacenter IPs again.",
+                        exc,
+                    )
+                    await browser.close()
+                    using_proxy = False
+                    browser, page = await _new_browser_and_page(using_proxy)
+                    continue  # retry the same search without the proxy
                 logger.exception(
                     "DuvalClerk scrape failed for %s/%s", search.county, search.notice_type
                 )
                 if failures is not None:
                     failures.append(f"DuvalClerk {search.county}/{search.notice_type}: {exc}")
+                idx += 1
 
         await browser.close()
 

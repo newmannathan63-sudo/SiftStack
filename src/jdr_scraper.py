@@ -687,6 +687,22 @@ async def _submit_search_form(
         logger.warning("JDR: submit button not found — pressing Enter as fallback")
         await page.keyboard.press("Enter")
 
+    # If every single form element came up empty, this isn't a real search
+    # page — the live site always has all four (verified 2026-06-07/09-06).
+    # That combination means Cloudflare served its "Just a moment..."
+    # challenge (or something else replaced the page) instead of the search
+    # form. Silently falling through as if the (nonexistent) search had
+    # succeeded is exactly the bug fixed in 72929c9 for hard crashes — this
+    # is the same failure mode but degrading instead of raising, so it never
+    # tripped that fix. Raise so it does: the caller's except block records
+    # it in `failures` and Slack gets a distinct crash alert instead of the
+    # ordinary empty-run heartbeat.
+    if not (date_filled or cat_filled or county_filled or submitted):
+        raise RuntimeError(
+            "JDR: no search-form elements found at all (date/category/county/submit) "
+            "— likely a Cloudflare challenge page, not the real search form"
+        )
+
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except PwTimeout:
