@@ -52,6 +52,7 @@ DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai logi
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")                    # Apify API token (for syncing cloud run output)
+BRIGHTDATA_PROXY_URL = os.getenv("BRIGHTDATA_PROXY_URL", "")  # Web Unlocker zone -- JDR-only, beats Cloudflare
 ANCESTRY_EMAIL = os.getenv("ANCESTRY_EMAIL", "")              # Ancestry.com login
 ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key

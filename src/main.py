@@ -174,6 +174,7 @@ async def actor_main() -> None:
             "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
             "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
             "TRESTLE_API_KEY": actor_input.get("trestle_api_key", ""),
+            "BRIGHTDATA_PROXY_URL": actor_input.get("brightdata_proxy_url", ""),
         }
         for key, val in _cred_map.items():
             setattr(config, key, val)
@@ -251,6 +252,16 @@ async def actor_main() -> None:
                 Actor.log.info("Residential proxy configured")
             except Exception:
                 Actor.log.warning("Could not configure residential proxy — running without proxy")
+
+        # JDR sits behind Cloudflare, which the Apify residential proxy alone
+        # hasn't reliably beaten (see jdr_scraper.py's module docstring) --
+        # route JDR specifically through a Bright Data Web Unlocker zone
+        # instead when configured. Duval Clerk keeps the Apify proxy above;
+        # it isn't Cloudflare-blocked, just occasionally handed a bad exit
+        # node (which scrape_duval_clerk_all now falls back around).
+        jdr_proxy_url = config.BRIGHTDATA_PROXY_URL or proxy_url
+        if config.BRIGHTDATA_PROXY_URL:
+            Actor.log.info("JDR: using Bright Data Web Unlocker proxy")
 
         # Track seen notice IDs for incremental dedup
         seen_ids: set[str] = set()
@@ -410,7 +421,7 @@ async def actor_main() -> None:
                     seen_ids=seen_ids,
                     llm_api_key=config.ANTHROPIC_API_KEY or None,
                     failures=scrape_failures,
-                    proxy_url=proxy_url,
+                    proxy_url=jdr_proxy_url,
                 )
                 notices.extend(jdr_notices)
 
@@ -2203,6 +2214,7 @@ def _run_scrape_pipeline(args, searches) -> None:
             since_date=effective_since,
             seen_ids=seen_ids,
             llm_api_key=config.ANTHROPIC_API_KEY or None,
+            proxy_url=config.BRIGHTDATA_PROXY_URL or None,
         ))
         save_state(SEEN_IDS_FILE, seen_ids)
         notices.extend(jdr_notices)
