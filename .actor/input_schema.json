@@ -76,8 +76,7 @@
             "type": "string",
             "description": "Full proxy URL (http://user:pass@host:port) from a Bright Data Web Unlocker zone. Used only for JDR (legals.jaxdailyrecord.com), which the Apify residential proxy doesn't reliably get past Cloudflare on. Duval Clerk keeps using the Apify residential proxy above. Leave empty to fall back to the Apify residential proxy for JDR too.",
             "editor": "textfield",
-            "isSecret": true,
-            "default": ""
+            "isSecret": true
         },
         "google_drive_folder_id": {
             "title": "Google Drive Folder ID",
