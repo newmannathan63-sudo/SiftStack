@@ -1080,6 +1080,13 @@ async def scrape_jdr_all(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+            # Web Unlocker-style proxies (Bright Data) terminate HTTPS with
+            # their own certificate to do the unlocking work in-flight, which
+            # a normal cert check rejects outright (net::ERR_CERT_AUTHORITY_
+            # INVALID, confirmed 2026-09-12 -- every goto failed instantly,
+            # before ever reaching Cloudflare). Scoped to this one context,
+            # which only ever talks to the public, no-login JDR site.
+            ignore_https_errors=True,
         )
         await Stealth().apply_stealth_async(context)
         context.set_default_timeout(30_000)
