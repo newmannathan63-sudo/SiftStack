@@ -306,7 +306,17 @@ async def _fetch_lp_details(page: Page, instrument_cell) -> dict:
 
         resp = await new_page.request.get(pdf_url, timeout=20_000)
         if resp.status == 200:
-            result["pdf_bytes"] = await resp.body()
+            body = await resp.body()
+            # The portal returns HTTP 200 with an "Image Not Available" /
+            # "This image has not been released." text page for documents
+            # not yet released — same status as a real PDF, so a status
+            # check alone silently stores that placeholder as if it were
+            # the document. Verified 2026-09-12. Real PDFs start with the
+            # %PDF- magic bytes; reject anything else.
+            if body.startswith(b"%PDF-"):
+                result["pdf_bytes"] = body
+            else:
+                logger.debug("  LP document not yet released (non-PDF response): %s", pdf_url)
         return result
     except Exception as e:
         logger.debug("  LP details fetch failed: %s", e)
