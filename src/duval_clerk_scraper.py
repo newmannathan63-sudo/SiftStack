@@ -1509,14 +1509,20 @@ async def scrape_duval_clerk_all(
         page = await context.new_page()
         return browser, page
 
-    # Residential-proxy sessions from Apify are occasionally handed a exit
-    # node that can't tunnel to or.duvalclerk.com at all (net::ERR_TUNNEL_
-    # CONNECTION_FAILED, seen 2026-09-09/10/12 — a hard connect failure, not
-    # the slow/stale response the proxy was added to fix). That's worse than
-    # the pre-proxy datacenter path, which at least returned data (if
-    # possibly stale). Fall back to a proxy-less browser once per run so a
-    # bad session doesn't zero out the whole day.
-    _PROXY_FAILURE_MARKERS = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED")
+    # Residential-proxy sessions from Apify are occasionally handed an exit
+    # node that can't reach or.duvalclerk.com at all — a hard connect failure,
+    # not the slow/stale response the proxy was added to fix. Confirmed on
+    # three separate runs (2026-09-09/10/12) with three DIFFERENT underlying
+    # Chromium network errors (ERR_TUNNEL_CONNECTION_FAILED, then a same-day
+    # retry surfaced ERR_TIMED_OUT instead) — a bad exit node doesn't fail
+    # the same way twice, so matching specific error strings is a losing
+    # game. Match on the net::ERR_ prefix instead: any Chromium network-layer
+    # error on this specific goto is far more likely to be the proxy than
+    # this public government portal being down. That's worse than the
+    # pre-proxy datacenter path, which at least returned data (if possibly
+    # stale) — fall back to a proxy-less browser once per run so a bad
+    # session doesn't zero out the whole day.
+    _PROXY_FAILURE_MARKER = "net::ERR_"
 
     async with async_playwright() as p:
         using_proxy = bool(proxy_url)
@@ -1535,7 +1541,7 @@ async def scrape_duval_clerk_all(
                     current_released_through = rt
                 idx += 1
             except Exception as exc:
-                if using_proxy and any(m in str(exc) for m in _PROXY_FAILURE_MARKERS):
+                if using_proxy and _PROXY_FAILURE_MARKER in str(exc):
                     logger.warning(
                         "DuvalClerk: residential proxy session couldn't tunnel to the "
                         "site (%s) — falling back to a direct connection for this run. "
