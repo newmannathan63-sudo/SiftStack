@@ -811,6 +811,19 @@ async def _extract_index_rows(page: Page) -> list[tuple[str, str, dict]]:
         "table[role='grid']",
         "table",
     ]
+    # The Kendo grid can still be rendering its AJAX response for a moment
+    # after "networkidle" fires (networkidle only means no in-flight network
+    # requests, not that the grid's JS has finished building the DOM) — an
+    # instant query_selector right after can race it and find nothing, wrongly
+    # triggering the CSV fallback below even though the grid appears a beat
+    # later. Confirmed as the actual cause of falling back on 2026-09-08/09/12
+    # (3 of 5 days), when this fallback is meant to be rare. Wait briefly for
+    # any of the selectors before concluding there's really no table.
+    try:
+        await page.wait_for_selector(", ".join(table_selectors), timeout=8_000)
+    except PwTimeout:
+        pass
+
     result_tbl = None
     for sel in table_selectors:
         tbl = await page.query_selector(sel)
