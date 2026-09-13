@@ -263,13 +263,16 @@ async def _run_bulk_search(
 
         # Step 2: Map the columns — a drag-and-drop widget, not dropdowns.
         # Each CSV column is a chip (.start-zone .item); each target field is
-        # a drop zone (.final-zone), in fixed DOM order: 0 First Name,
-        # 1 Last Name, 2 Mailing Address, 3 Middle Name, 4 Mailing City,
-        # 5 Mailing State, 6 Mailing Zip, 7-10 Property Address/City/State/Zip.
+        # a drop zone (.final-zone), in fixed DOM order: 0 Company/Trust Name,
+        # 1 First Name, 2 Last Name, 3 Mailing Address, 4 Middle Name,
+        # 5 Mailing City, 6 Mailing State, 7 Mailing Zip, 8-11 Property
+        # Address/City/State/Zip. SmartSkip inserted "Company/Trust Name" as
+        # zone 0 (live-verified 2026-09-09, shifting every zone below it +1
+        # from the order this was originally calibrated against).
         zones = page.locator(".final-zone")
         column_to_zone = {
-            "first_name": 0, "last_name": 1, "address": 2,
-            "city": 4, "state": 5, "zip": 6,
+            "first_name": 1, "last_name": 2, "address": 3,
+            "city": 5, "state": 6, "zip": 7,
         }
         for col, zone_idx in column_to_zone.items():
             chip = page.locator(".start-zone .item", has_text=col).first
