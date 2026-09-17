@@ -116,7 +116,7 @@ _NON_MORTGAGE_PLAINTIFF_RE = re.compile(
     r"VILLAS?\s+ASSOC(?:IATION)?|CLUB\s+ESTATES|OWNERS?\s+ASSOC(?:IATION)?|"
     # Contractor / mechanic's lien filers
     r"ROOFING|CONSTRUCTION|PLUMBING|ELECTRIC(?:AL)?|HVAC|FLOORING|"
-    r"PAINTING|REMODEL(?:ING)?|CONTRACTOR|BUILDERS?\b|RENOVATION"
+    r"PAINTING|REMODEL(?:ING)?|CONTRACTOR|BUILDERS?\b|RENOVATION|RESTORATION"
     r")\b",
     re.IGNORECASE,
 )
@@ -129,6 +129,29 @@ _NON_MORTGAGE_PLAINTIFF_RE = re.compile(
 _GENERIC_ASSOCIATION_INC_RE = re.compile(
     r"\bASSOCIATION,?\s+INC\b", re.IGNORECASE,
 )
+
+# Duval circuit/county court case numbers encode the case type as the third
+# segment (16-YYYY-<TYPE>-NNNNNN-...). Mortgage foreclosures only ever show
+# up as "CA" (circuit civil) or "CC" (county civil) — verified against every
+# case number seen in this project's output/manual_traces history (706 CA,
+# 176 CC, 0 of anything else legitimate).
+#
+# Deliberately an ALLOWLIST, not a denylist of known-bad types. The plaintiff
+# pre-filter above is a denylist keyed on business-sounding names (HOA/
+# contractor), so anything that isn't a recognized bad keyword defaults to
+# "treat as mortgage lender" — a person suing another person (e.g. a spouse
+# filing an LP against marital property in a divorce) sails right through it.
+# Verified live 2026-09-17: "AKEL SUMMAR L" v. "AKEL NADER A"/"AKEL AKEL J",
+# case 16-2022-DR-003389-FMXX-MA ("DR" = domestic relations), produced 3
+# non-foreclosure lis_pendens records in the daily output before this was
+# caught. A denylist of DR/PR/etc. would only guard against case types
+# already seen; an allowlist of the two known-good types instead rejects
+# ANY future unexpected case type (probate, small claims, criminal, whatever
+# else) by default, with no further keyword-chasing needed. Case type is
+# only known once the Details-page case_number has been fetched, so this is
+# checked post-fetch alongside the hoa_lien check, not in the cheap
+# plaintiff-only pre-filter.
+_MORTGAGE_CASE_TYPE_RE = re.compile(r"-\d{4}-(CA|CC)-", re.IGNORECASE)
 
 
 def _plaintiff_is_mortgage_lender(plaintiff: str) -> bool:
@@ -169,6 +192,14 @@ def _is_mortgage_preforeclosure(plaintiff: str, defendant: str, doc_fields: dict
     from config import BUSINESS_RE
     if not _plaintiff_is_mortgage_lender(plaintiff):
         return False
+    if doc_fields:
+        case_number = doc_fields.get("case_number", "")
+        # Only reject when we actually HAVE a case number that fails the
+        # allowlist — a missing/unfetched case_number (timeout, fetch
+        # failure) shouldn't silently drop an otherwise-valid row; that
+        # falls through to the existing name-based rules below instead.
+        if case_number and not _MORTGAGE_CASE_TYPE_RE.search(case_number):
+            return False
     if BUSINESS_RE.search(defendant):
         if doc_fields and doc_fields.get("mortgage_confirmed"):
             return True
