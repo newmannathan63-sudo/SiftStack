@@ -584,6 +584,7 @@ async def upload_csv(
     await page.wait_for_timeout(2000)
     await _screenshot(page, "step5_review")
 
+    finish_clicked = False
     try:
         finish_btn = page.locator(
             'button:has-text("Finish Upload"), '
@@ -592,6 +593,7 @@ async def upload_csv(
         )
         if await finish_btn.count() > 0:
             await finish_btn.first.click()
+            finish_clicked = True
             logger.info("Clicked Finish Upload")
         else:
             await _screenshot(page, "step5_no_finish_btn")
@@ -599,32 +601,34 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Finish step: %s", e)
 
-    # After "Finish Upload", DataSift redirects to the Records page — that IS the success signal.
+    # NOTE: the upload wizard is a modal overlaid on /records/properties — it never
+    # navigates away, so wait_for_url("**/records/**") is trivially true from the
+    # moment the wizard opens and is NOT a valid success signal (confirmed via live
+    # network-trace debugging: this previously reported "success" on runs where the
+    # backend received nothing and no data was ever written). The real signal is the
+    # "Review your upload" modal actually closing in response to the click.
+    if not finish_clicked:
+        result["message"] = "Finish Upload button was never clicked"
+        await _save_cookies(page)
+        return result
+
     try:
-        await page.wait_for_url("**/records/**", timeout=15000)
+        await page.locator('text="Review your upload"').first.wait_for(
+            state="hidden", timeout=20000
+        )
         result["success"] = True
         result["message"] = "Upload submitted — processing in background"
-        logger.info("DataSift upload submitted (redirected to Records page)")
+        logger.info("DataSift upload wizard closed after Finish Upload")
     except PwTimeout:
-        # May still be on the wizard (e.g. if DataSift shows inline confirmation)
-        try:
-            success_indicator = page.locator(
-                'text="Upload Complete", '
-                'text="successfully", '
-                'text="records imported", '
-                'text="records added", '
-                'text="records uploaded"'
-            )
-            await success_indicator.first.wait_for(timeout=20000)
-            success_text = await success_indicator.first.text_content()
-            result["success"] = True
-            result["message"] = success_text or "Upload completed"
-            logger.info("DataSift upload complete: %s", result["message"])
-        except PwTimeout:
-            await _screenshot(page, "step5_timeout")
-            result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
-            logger.warning(result["message"])
-            result["success"] = True
+        # Modal never closed — the click did not actually complete the wizard.
+        await _screenshot(page, "step5_timeout")
+        result["success"] = False
+        result["message"] = (
+            "Finish Upload was clicked but the wizard modal never closed — "
+            "upload was NOT confirmed. Check step5_timeout screenshot and verify "
+            "manually before trusting this as a success."
+        )
+        logger.error(result["message"])
 
     await _save_cookies(page)
     return result
